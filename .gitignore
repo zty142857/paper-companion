@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.venv/
+.venv-win/
+__pycache__/
+*.env
+backend/data/
+.uv-cache/
+testdata/
+logs/
+*.pyc
+~$*
+.DS_Store
