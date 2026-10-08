@@ -14,6 +14,21 @@ CAPTION_RE = re.compile(r"^(figure|fig\.?|table|tab\.?|eq\.?|equation|scheme|alg
 REF_ENTRY_RE = re.compile(
     r"(?:\bIn\s+[A-Z][A-Za-z]+[,.]|\bpp?\.\s*\d|\bvol\.\s*\d|\barXiv:|\bdoi:"
     r"|,\s*(?:19|20)\d{2}\b|\b(?:19|20)\d{2}\.\s*$)", re.I)
+# 作者单位/联系信息，不是章节标题
+AFFIL_RE = re.compile(
+    r"\b(university|institute|college|school|department|faculty|laborator(?:y|ies)"
+    r"|academy|e-?mail|univ\.)\b", re.I)
+
+
+def _single_letter_only(text: str) -> bool:
+    """整块由单字母词组成（图例/坐标轴标注，如 "O O O O D D C D D"）→ 不是标题。"""
+    words = [w.strip(".,:;()[]") for w in text.split()]
+    return bool(words) and all(len(w) <= 1 for w in words)
+
+
+def _authorish(text: str) -> bool:
+    """作者行特征：姓名后带机构编号上标（如 "Webster III1 and Bryan A. Jones2"）→ 不是标题。"""
+    return bool(re.search(r"[A-Za-z]\d", text))
 
 
 def _first_line_bold(block) -> bool:
@@ -30,7 +45,8 @@ def _first_line_italic(block) -> bool:
     return False
 
 
-def _plain_heading(text: str, lines: list, max_size: float, body_size: float, alpha: float) -> bool:
+def _plain_heading(text: str, lines: list, max_size: float, body_size: float,
+                   alpha: float, italic: bool = False) -> bool:
     """无编号、无加粗、字号只比正文大一点点的短标题。
 
     典型如 ASME/Elsevier 单行标题：10pt 标题 + 9pt 正文，字体与正文不同但 PyMuPDF 不报加粗。
@@ -40,6 +56,8 @@ def _plain_heading(text: str, lines: list, max_size: float, body_size: float, al
     if len(lines) != 1 or not text:
         return False
     if CAPTION_RE.match(text) or text[0].islower() or text[0].isdigit():
+        return False
+    if _single_letter_only(text) or _authorish(text) or AFFIL_RE.search(text) or italic:
         return False
     words = text.split()
     if not (1 <= len(words) <= 12) or not (4 <= len(text) < 90):
@@ -174,14 +192,16 @@ def parse_pdf(path: str) -> dict:
             italic = _first_line_italic(b)
             upperish = bool(UPPER_HEAD_RE.fullmatch(text)) and not any(c.isdigit() for c in text)
             numbered = bool(HEADING_RE.match(text)) and not REF_ENTRY_RE.search(text)
-            plain = _plain_heading(text, b["lines"], max_size, body_size, alpha)
+            plain = _plain_heading(text, b["lines"], max_size, body_size, alpha, italic)
             if plain and _inside_figure(b["bbox"], figure_boxes):
                 plain = False
             # 数字编号标题（如 "2.1. xxx"）本身即强信号：部分期刊子节标题不加粗、不放大也不斜体，
             # 故编号匹配即可判为标题；其余情况仍需字号/加粗/斜体信号。
             is_head = (len(text) < 120 and alpha > 0.35
+                       and not _single_letter_only(text) and not _authorish(text)
                        and (numbered or plain or ((sizey or boldy or italic)
-                                                  and (REF_HEADING_RE.match(text) or upperish))))
+                                                  and (REF_HEADING_RE.match(text) or upperish)
+                                                  and not AFFIL_RE.search(text))))
             kind = "formula" if (alpha < 0.25 and any(c.isdigit() for c in text)) else "para"
             items.append((col, b["bbox"][1], "heading" if is_head else kind, text, b["bbox"], max_size))
         items.sort(key=lambda it: (it[0], it[1]))
