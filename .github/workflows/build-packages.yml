@@ -18,7 +18,7 @@ jobs:
             target: win-x64
           - os: ubuntu-22.04
             target: linux-x64
-          - os: macos-13
+          - os: macos-15-intel
             target: macos-x64
           - os: macos-14
             target: macos-arm64
@@ -46,7 +46,21 @@ jobs:
         run: python -m pip install patchelf
 
       - name: Build package
-        run: python packaging/build.py --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python packaging/build.py --target ${{ matrix.target }} 2>&1 | tee build.log
+
+      - name: Publish build log on failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.target }} 构建失败日志"
+            echo '```text'
+            tail -n 80 build.log 2>/dev/null || echo "build.log 不存在"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show toolchain versions
         if: always()
