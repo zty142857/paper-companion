@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import mimetypes
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -8,6 +9,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import ai, db, llm, pdf_parse, profile, quiz, search, summarize
+
+# Windows 的 MIME 注册表缺 .mjs 映射，默认会退化成 text/plain，
+# 浏览器对 import() 的模块有 MIME 校验，会拒绝加载 PDF.js worker。
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("text/javascript", ".js")
 
 app = FastAPI(title="paper-companion")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])

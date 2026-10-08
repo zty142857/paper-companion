@@ -145,7 +145,14 @@ def build_backend() -> str:
 def make_release(built: str, target: str) -> str:
     stage = os.path.join(RELEASE, f"{APP_NAME}-{target}")
     os.makedirs(RELEASE, exist_ok=True)
+    kept_data = None
     if os.path.isdir(stage):
+        # release 目录常被直接当运行目录，重建时先把它旁边的 data/ 挪出来，避免误删用户数据
+        data_dir = os.path.join(stage, "data")
+        if os.path.isdir(data_dir):
+            kept_data = os.path.join(RELEASE, f"{APP_NAME}-{target}.data-keep-{int(time.time())}")
+            os.rename(data_dir, kept_data)
+            print(f"提示：已暂存用户数据目录 -> {kept_data}")
         try:
             shutil.rmtree(stage)
         except PermissionError:
@@ -180,6 +187,9 @@ def make_release(built: str, target: str) -> str:
 
     with open(os.path.join(stage, "README.txt"), "w", encoding="utf-8") as f:
         f.write(README)
+    if kept_data and os.path.isdir(kept_data):
+        os.rename(kept_data, os.path.join(stage, "data"))
+        print("提示：已把用户数据目录放回新版本中")
     return stage
 
 
