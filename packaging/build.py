@@ -142,7 +142,7 @@ def build_backend() -> str:
     return out
 
 
-def make_release(built: str, target: str) -> str:
+def make_release(built: str, target: str) -> tuple[str, str | None]:
     stage = os.path.join(RELEASE, f"{APP_NAME}-{target}")
     os.makedirs(RELEASE, exist_ok=True)
     kept_data = None
@@ -187,24 +187,33 @@ def make_release(built: str, target: str) -> str:
 
     with open(os.path.join(stage, "README.txt"), "w", encoding="utf-8") as f:
         f.write(README)
-    if kept_data and os.path.isdir(kept_data):
-        os.rename(kept_data, os.path.join(stage, "data"))
-        print("提示：已把用户数据目录放回新版本中")
-    return stage
+    # 注意：这里不还原 data/，要等打包完成后再放回，避免把用户数据和 Key 打进发行包
+    return stage, kept_data
 
 
 def archive(stage: str, target: str) -> str:
+    data_prefix = os.path.join(stage, "data")
+
+    def skip_personal_data(path: str) -> bool:
+        return os.path.abspath(path).startswith(os.path.abspath(data_prefix))
+
     if target.startswith("linux"):
         out = os.path.join(RELEASE, f"{APP_NAME}-{target}.tar.gz")
         with tarfile.open(out, "w:gz") as tar:
-            tar.add(stage, arcname=os.path.basename(stage))
+            def filt(info: tarfile.TarInfo):
+                return None if skip_personal_data(info.name) else info
+            tar.add(stage, arcname=os.path.basename(stage), filter=filt)
     else:
         out = os.path.join(RELEASE, f"{APP_NAME}-{target}.zip")
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             base = os.path.dirname(stage)
             for folder, _dirs, files in os.walk(stage):
+                if skip_personal_data(folder):
+                    continue
                 for name in files:
                     full = os.path.join(folder, name)
+                    if skip_personal_data(full):
+                        continue
                     # zip 规范要求正斜杠，Windows 的 os.sep 是反斜杠
                     zf.write(full, os.path.relpath(full, base).replace(os.sep, "/"))
     return out
@@ -221,10 +230,15 @@ def main() -> None:
 
     build_frontend(args.skip_npm)
     built = build_backend()
-    stage = make_release(built, target)
+    stage, kept_data = make_release(built, target)
     out = archive(stage, target)
     size_mb = os.path.getsize(out) / 1024 / 1024
     print(f"\n完成：{out}（{size_mb:.1f} MB）")
+
+    # 发行包生成后再把本地用户数据放回目录，本地运行时数据仍在
+    if kept_data and os.path.isdir(kept_data):
+        os.rename(kept_data, os.path.join(stage, "data"))
+        print("提示：用户数据已放回本地目录（未进入发行包）")
 
 
 if __name__ == "__main__":
