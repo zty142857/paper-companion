@@ -8,6 +8,12 @@ import pymupdf
 HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d{1,2}){0,3}\.?\s+[A-Z][A-Za-z].{1,80}$")
 REF_HEADING_RE = re.compile(r"^(references|bibliography|参考文献|references?\s*and\s*notes)$", re.I)
 UPPER_HEAD_RE = re.compile(r"[A-Z][A-Z\s,.&\-()]{3,}")
+# 图/表/公式题注虽然也短，但不是章节标题
+CAPTION_RE = re.compile(r"^(figure|fig\.?|table|tab\.?|eq\.?|equation|scheme|algorithm|listing)\b", re.I)
+# 参考文献条目常以年份或编号开头，容易误命中"数字编号标题"
+REF_ENTRY_RE = re.compile(
+    r"(?:\bIn\s+[A-Z][A-Za-z]+[,.]|\bpp?\.\s*\d|\bvol\.\s*\d|\barXiv:|\bdoi:"
+    r"|,\s*(?:19|20)\d{2}\b|\b(?:19|20)\d{2}\.\s*$)", re.I)
 
 
 def _first_line_bold(block) -> bool:
@@ -21,6 +27,39 @@ def _first_line_italic(block) -> bool:
     for ln in block["lines"]:
         spans = [sp for sp in ln["spans"] if sp["text"].strip()]
         return bool(spans) and all(sp["flags"] & 2 for sp in spans)
+    return False
+
+
+def _plain_heading(text: str, lines: list, max_size: float, body_size: float, alpha: float) -> bool:
+    """无编号、无加粗、字号只比正文大一点点的短标题。
+
+    典型如 ASME/Elsevier 单行标题：10pt 标题 + 9pt 正文，字体与正文不同但 PyMuPDF 不报加粗。
+    判据刻意保守：必须单行、首字母大写、2~12 个词、无句末标点、且字号在正文的 1.04~1.30 倍之间，
+    以此排除正文碎片、图题以及字号明显更大的作者名/论文标题。
+    """
+    if len(lines) != 1 or not text:
+        return False
+    if CAPTION_RE.match(text) or text[0].islower() or text[0].isdigit():
+        return False
+    words = text.split()
+    if not (1 <= len(words) <= 12) or not (4 <= len(text) < 90):
+        return False
+    if alpha < 0.5 or re.search(r"[.,;:]\s*$", text):
+        return False
+    if not body_size:
+        return False
+    return 1.04 <= (max_size / body_size) <= 1.30
+
+
+def _inside_figure(bbox, figure_boxes: list) -> bool:
+    """文本块大部分落在图片区域里 → 是图内标注（如任务名、坐标轴文字），不是章节标题。"""
+    x0, y0, x1, y1 = bbox
+    area = max((x1 - x0) * (y1 - y0), 1e-6)
+    for fx0, fy0, fx1, fy1 in figure_boxes:
+        ix = max(0.0, min(x1, fx1) - max(x0, fx0))
+        iy = max(0.0, min(y1, fy1) - max(y0, fy0))
+        if (ix * iy) / area >= 0.6:
+            return True
     return False
 
 
@@ -103,15 +142,20 @@ def parse_pdf(path: str) -> dict:
     cur_sec: Section | None = None
     pending_head: Section | None = None  # 页首孤立标题，与上一页末标题合并判断用
 
-    for pno, page in enumerate(doc):
-        w = page.rect.width
-        d = page.get_text("dict")
+    n_pages = len(doc)
+    pages_data: list[tuple[float, dict]] = [(page.rect.width, page.get_text("dict")) for page in doc]
+    # 正文基准字号取整篇的中位数：按单页取中位数会被图表密集页带偏，
+    # 导致图内小标签（6~7pt）反而"比正文大"而被误判成标题。
+    all_sizes = [s for _w, d in pages_data for b in d["blocks"]
+                 if b["type"] == 0 for s in _line_font_sizes(b)]
+    body_size = statistics.median(all_sizes) if all_sizes else 10
+
+    for pno, (w, d) in enumerate(pages_data):
         raw = [b for b in d["blocks"] if (b["type"] == 0 and b.get("lines")) or b["type"] == 1]
         if not raw:
             continue
         cols = _detect_columns(raw, w)
-        sizes = [s for b in raw if b["type"] == 0 for s in _line_font_sizes(b)]
-        body_size = statistics.median(sizes) if sizes else 10
+        figure_boxes = [b["bbox"] for b in raw if b["type"] == 1]
         items = []
         for b in raw:
             cx = (b["bbox"][0] + b["bbox"][2]) / 2
@@ -129,12 +173,15 @@ def parse_pdf(path: str) -> dict:
             boldy = _first_line_bold(b) and max_size >= body_size * 0.95
             italic = _first_line_italic(b)
             upperish = bool(UPPER_HEAD_RE.fullmatch(text)) and not any(c.isdigit() for c in text)
-            numbered = bool(HEADING_RE.match(text))
+            numbered = bool(HEADING_RE.match(text)) and not REF_ENTRY_RE.search(text)
+            plain = _plain_heading(text, b["lines"], max_size, body_size, alpha)
+            if plain and _inside_figure(b["bbox"], figure_boxes):
+                plain = False
             # 数字编号标题（如 "2.1. xxx"）本身即强信号：部分期刊子节标题不加粗、不放大也不斜体，
             # 故编号匹配即可判为标题；其余情况仍需字号/加粗/斜体信号。
             is_head = (len(text) < 120 and alpha > 0.35
-                       and (numbered or ((sizey or boldy or italic)
-                                         and (REF_HEADING_RE.match(text) or upperish))))
+                       and (numbered or plain or ((sizey or boldy or italic)
+                                                  and (REF_HEADING_RE.match(text) or upperish))))
             kind = "formula" if (alpha < 0.25 and any(c.isdigit() for c in text)) else "para"
             items.append((col, b["bbox"][1], "heading" if is_head else kind, text, b["bbox"], max_size))
         items.sort(key=lambda it: (it[0], it[1]))
@@ -168,7 +215,7 @@ def parse_pdf(path: str) -> dict:
     doc.close()
     return {
         "title": title,
-        "pages": pno + 1,
+        "pages": n_pages,
         "blocks": [asdict(b) for b in blocks],
         "sections": [asdict(s) for s in sections],
     }

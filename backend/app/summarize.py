@@ -123,15 +123,17 @@ def _numbered_depth(title: str) -> int | None:
 
 
 def _gen_outlines(digest: str, structure: dict, familiarity: str | None = None) -> list[dict]:
-    """为所有带编号的 section（篇/章/节）各生成一句话概要，逐级概括。"""
+    """为每个 section 各生成一句话概要：有编号的按编号定层级，无编号的按顶层处理。"""
     secs = []
     for s in structure["sections"]:
         if s["is_references"]:
             continue
-        depth = _numbered_depth(s["title"])
-        if depth is None:
-            continue                      # 跳过无编号标题
-        secs.append({**s, "depth": depth})
+        title = (s.get("title") or "").strip()
+        if not title or title.startswith("("):
+            continue                      # 跳过 "(正文开头)" 这类占位节
+        # 无编号标题（如 Introduction / Kinematic Analysis）同样要出概要，按顶层处理；
+        # 否则整篇无编号的论文（ASME/Elsevier 常见）会一条概要都生成不出来。
+        secs.append({**s, "depth": _numbered_depth(title) or 1})
     if not secs:
         return []
     # 目录（带层级缩进与页码），帮助模型理解层级归属
@@ -143,6 +145,7 @@ def _gen_outlines(digest: str, structure: dict, familiarity: str | None = None) 
 要求：
 - 每条概要**只写一句话**（可用分号连接，但不要拆成多句）。
 - 层级1的标题概括其**整个范围**（含下属所有子标题的内容），层级2概括本章，层级3概括本节；逐级收窄。
+- 若多个标题同为层级1且都没有子标题（整篇无编号的情况），则每个标题只概括它自己那一段正文（到下一个标题为止），不要串到别节。
 - {_tone_line(familiarity)}
 - 严格依据对应范围正文，不编造。
 必须覆盖全部标题（共 {len(secs)} 个）：
