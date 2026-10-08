@@ -1,8 +1,10 @@
 import os
+import sys
 import threading
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import ai, db, llm, pdf_parse, profile, quiz, search, summarize
@@ -423,3 +425,20 @@ def clear_data():
     """一键清除全部本地数据（论文/卡片/档案/元数据/PDF；保留模型配置但清除 Key）。"""
     n = db.clear_all_data(keep_llm_settings=True)
     return {"ok": True, "papers_removed": n}
+
+
+# ---------------- 前端静态托管（同一端口，免 Node / 免跨域） ----------------
+
+def _frontend_dist() -> str:
+    """打包后前端在 _MEIPASS/frontend_dist，源码运行时在 ../frontend/dist。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return os.path.join(meipass, "frontend_dist")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(root, "frontend", "dist")
+
+
+_DIST = _frontend_dist()
+if os.path.isdir(_DIST):
+    # 必须放在所有 /api 路由之后：静态挂载只兜底未命中的路径
+    app.mount("/", StaticFiles(directory=_DIST, html=True), name="frontend")

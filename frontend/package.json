@@ -13,10 +13,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@rolldown/binding-linux-x64-gnu": "^1.2.11",
     "pdfjs-dist": "^6.3.289",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
+  },
+  "optionalDependencies": {
+    "@rolldown/binding-darwin-arm64": "^1.2.11",
+    "@rolldown/binding-darwin-x64": "^1.2.11",
+    "@rolldown/binding-linux-x64-gnu": "^1.2.11",
+    "@rolldown/binding-win32-x64-msvc": "^1.2.11"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

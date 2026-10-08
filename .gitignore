@@ -8,6 +8,8 @@ backend/data/
 .uv-cache/
 testdata/
 logs/
+build/
+release/
 *.pyc
 ~$*
 .DS_Store

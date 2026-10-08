@@ -1,10 +1,19 @@
 import json
 import os
 import sqlite3
+import sys
 import time
 import uuid
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+def _data_dir() -> str:
+    """数据目录：打包后放在可执行文件旁边（升级覆盖程序不丢数据），源码运行放在 backend/ 下。"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "data")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+
+DATA_DIR = _data_dir()
 PDF_DIR = os.path.join(DATA_DIR, "pdfs")
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 os.makedirs(PDF_DIR, exist_ok=True)
