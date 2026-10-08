@@ -77,3 +77,51 @@ jobs:
           name: paper-companion-${{ matrix.target }}
           path: release/*
           if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载四平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -lh dist
+          cat > notes.md <<'EOF'
+          ## 论文阅读智能学伴
+
+          解压即用，**不需要安装 Python 或 Node**。
+
+          ### 下载哪个？
+          | 你的系统 | 下载文件 |
+          | --- | --- |
+          | Windows 64 位 | `paper-companion-win-x64.zip` |
+          | macOS Apple 芯片（M1/M2/M3/M4） | `paper-companion-macos-arm64.zip` |
+          | macOS Intel 芯片 | `paper-companion-macos-x64.zip` |
+          | Linux 64 位 | `paper-companion-linux-x64.tar.gz` |
+
+          ### 怎么启动
+          1. 解压压缩包
+          2. 双击启动脚本：Windows 用 `start.bat`；macOS 右键 `start.command` → 打开；Linux 执行 `./start.sh`
+          3. 浏览器会自动打开（默认 http://127.0.0.1:8765 ）
+          4. 首次使用点右上角「模型设置」，填入你自己的 Base URL、API Key、模型名
+
+          ### 说明
+          - 论文、笔记、卡片全部保存在本机 `data` 文件夹，不上传任何服务器
+          - 只有调用 AI 功能时会把相关片段发送给你配置的模型服务商
+          - macOS 首次打开会提示「无法验证开发者」，右键 → 打开 即可
+          EOF
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "论文阅读智能学伴 ${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            dist/*
