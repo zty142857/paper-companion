@@ -48,6 +48,13 @@ jobs:
       - name: Build package
         run: python packaging/build.py --target ${{ matrix.target }}
 
+      - name: Show toolchain versions
+        if: always()
+        run: |
+          python --version
+          node --version
+          npm --version
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

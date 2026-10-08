@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -128,10 +129,25 @@ def build_backend() -> str:
 
 def make_release(built: str, target: str) -> str:
     stage = os.path.join(RELEASE, f"{APP_NAME}-{target}")
-    if os.path.isdir(stage):
-        shutil.rmtree(stage)
     os.makedirs(RELEASE, exist_ok=True)
-    shutil.copytree(built, stage)
+    if os.path.isdir(stage):
+        try:
+            shutil.rmtree(stage)
+        except PermissionError:
+            # 旧目录里有程序正在运行（data/app.db 被占用），挪到一边，不阻塞新构建
+            aside = f"{stage}.old-{int(time.time())}"
+            os.rename(stage, aside)
+            print(f"提示：旧目录被占用，已移动到 {aside}")
+
+    # Windows 上杀毒软件可能短时间锁住刚生成的文件，失败重试几次
+    for attempt in range(3):
+        try:
+            shutil.copytree(built, stage)
+            break
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
     if target.startswith("win"):
         with open(os.path.join(stage, "start.bat"), "w", encoding="utf-8") as f:
@@ -164,7 +180,8 @@ def archive(stage: str, target: str) -> str:
             for folder, _dirs, files in os.walk(stage):
                 for name in files:
                     full = os.path.join(folder, name)
-                    zf.write(full, os.path.relpath(full, base))
+                    # zip 规范要求正斜杠，Windows 的 os.sep 是反斜杠
+                    zf.write(full, os.path.relpath(full, base).replace(os.sep, "/"))
     return out
 
 
