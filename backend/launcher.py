@@ -13,6 +13,21 @@ import webbrowser
 
 import uvicorn
 
+
+def _setup_io() -> None:
+    """Windows 英文环境下控制台可能是 cp1252，打印中文会崩；重定向时统一用 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_setup_io()
+
 HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
 PORT_SPAN = 20

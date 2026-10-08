@@ -19,6 +19,21 @@ import tarfile
 import time
 import zipfile
 
+
+def _setup_io() -> None:
+    """输出被重定向时（CI 日志、管道）强制 UTF-8，避免中文打印触发 UnicodeEncodeError。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_setup_io()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND = os.path.join(ROOT, "frontend")
 BACKEND = os.path.join(ROOT, "backend")
