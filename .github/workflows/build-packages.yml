@@ -75,7 +75,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: paper-companion-${{ matrix.target }}
-          path: release/*
+          path: |
+            release/*.zip
+            release/*.tar.gz
           if-no-files-found: error
 
   release:
@@ -98,7 +100,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           ls -lh dist
+
+          # 清理历史遗留的"空 Release"（例如上次附件上传失败留下的）
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+                        --json tagName,assets \
+                        --jq '.[] | select((.assets|length)==0) | .tagName'); do
+            echo "清理空 Release: $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes || true
+          done
+
           cat > notes.md <<'EOF'
           ## 论文阅读智能学伴
 
@@ -123,8 +135,16 @@ jobs:
           - 只有调用 AI 功能时会把相关片段发送给你配置的模型服务商
           - macOS 首次打开会提示「无法验证开发者」，右键 → 打开 即可
           EOF
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "论文阅读智能学伴 ${GITHUB_REF_NAME}" \
-            --notes-file notes.md \
-            dist/*
+
+          # 只上传压缩包，不要把解压后的目录也当成附件
+          if gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/*.zip dist/*.tar.gz
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "论文阅读智能学伴 ${GITHUB_REF_NAME}" \
+              --notes-file notes.md \
+              dist/*.zip dist/*.tar.gz
+          fi
+          gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --json tagName,assets
