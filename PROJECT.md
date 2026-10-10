@@ -133,28 +133,33 @@ Paper.structure = { title, pages, blocks[], sections[] }   // 存 DB JSON
 Analysis = { elements[{kind,text,refs,pages,checked}], outlines[{section_id,outline}], terms[{term,zh,expl,refs,pages}] }
 Card { id, paper_id, type:"translation"|"chat"|"term", block_id /*锚点*/, top /*px*/,
        data:{offset?, width?, translation, orig, page | block_ids, messages[], term, zh, expl, collapsed, pending} }
-paper_meta = 领域/熟悉度/known_terms/dismissed_terms/plan/note/quiz_score/visited/collected/domain_guess
+paper_meta = 领域/熟悉度/known_terms/dismissed_terms/plan/note/quiz_score/visited/collected/domain_guess/quiz
+             // quiz = {questions[], answers[], grade|null}：整套自测的留存，重开面板可续做
 ```
 
 ### 解析算法要点（pdf_parse.py，改动前必读）
-- **分栏**：正文块左边缘 x0 对齐密度聚类（dominant 组 ≥ max(4, 12%~22%) 且组距≥150pt），对通栏标题/脚注/公式免疫
-- **标题**：**匹配数字编号标题（`HEADING_RE`，如 `2.1.`、`2.3.1.`）即判为标题**；其余情况需「字号>正文1.12倍 或 加粗 或 斜体」且匹配 References / 全大写模式，字母占比>0.35
-  - 2026-10 修复：此前斜体子节标题（如 Elsevier 的 `2.1.`）与同字号纯文本标题会被漏判，导致章节概要不全。现编号标题直接判为标题。
-- **公式碎片**：字母占比<0.25 且含数字 → type=formula（不进 LLM digest）
-- **竖排水印**：line dir 纵向的丢弃
-- **标题提取**：PDF metadata 优先，否则首页顶部字号最大的单段
-- 已知不足：跨页延续的节不做合并；参考文献节整节跳过 digest；论文的 section 顺序按 (栏, 页内 y) 而非编号数字排序
+- **分栏**：段落级块（≥2行或≥60字符）左边缘 x0 做 25pt 定宽分箱、按计数贪心选栏边（间距≥150pt；公式缩进/表格位移抢不过真栏边）；**全书聚合出文档级栏位做兜底**——双栏期刊栏 x 固定，短页/公式密集页/图表页单页检测失败且该页通栏段落不过半时借用全局栏位（首页豁免）。否则双栏页会被判成单栏、按纯 y 排序导致「左栏底部小节排到右栏顶部之后」
+- **杂项守卫**：\xa0 统一为普通空格；期刊栏目横幅（RESEARCH ARTICLE 等 BANNER_RE）不判标题；明显小于正文（<0.88×）且不加粗的行不判标题（脚注/算法步骤/表格单元）；标题行以 and/of 等小词收尾=被截断，强制并入下一行（"2. Continuum robot design and" + "optimization"）
+- **标题判定在行级**（2026-10 重写）：PyMuPDF 常把标题与正文合并进同一块，先把块切成 头/段 片段，标题可位于块中间；run-in 标题（"3.2.4. The Steerable Needle. Needles…"）在"句号+大写"处切开，**行内剩余文本回流段落不丢内容**；标题跨行自动并行合并；IEEE 降大小写首字（"T"+"HE in-situ"）复原为 "The in-situ"
+- **编号体系**：带点阿拉伯（`2.`/`3.2.4.`）、无点阿拉伯（LNCS/ICLR `1 Introduction`，须加粗/放大）、罗马（IEEE `I. INTRODUCTION`，小型大写与正文同字号不加粗也成立）、字母子节（`A. Design`，须样式信号）；层级=编号段数（罗马→1，字母→2），summarize._numbered_depth 与前端 secDepth 同步支持
+- **大小写模式分级**：Title Case/全大写→编号即成立；句子式正文→需样式信号；无样式句子式（LaTeX 小型大写）→短句、无逗号、字号≥正文0.95倍，且排除"下一行是小写开头长句"的段落/脚注首行
+- **span 拼接收空格**：不少 PDF（SAGE/Arbortext 等）词间空格是位移不是字符，按 span bbox 间隙补回，否则正文黏成一团毁掉一切正则；同 y 的"编号片段行"（ICLR 的 `1` + `INTRODUCTION`）会先合并
+- **守卫**：图注（CAPTION_RE）、文献条目（REF_ENTRY_RE，含年份括号/卷页/arXiv/doi）、作者上标（`Name,1`/`III1`）、单位行（AFFIL_RE）、URL/`[N]`引用标记、公式碎片（⊕∑ð 等符号）、首页顶部作者区与大字标题区 一律不判标题；仅"全大写+样式"命中的弱标题还要过栏内留白复核（表格列头被排除）
+- **标题提取**：meta 先过合法性校验（拒 "untitled"/生产号 `IJR368147 1661..1683`/页码区间/"Published as…"），无效则取首页顶部字号最大且像标题的段
+- **公式碎片**：字母占比<0.25 且含数字 → type=formula（不进 LLM digest）；竖排水印行丢弃
+- 已知不足：跨页延续的节不做合并；section 顺序按 (栏, 页内 y)（栏检测修复后与阅读顺序一致，但极端版式仍可能错位；可考虑按编号序列做稳定性排序）
 
 ### 章节概要层级（summarize._gen_outlines）
-- 层级 = 标题数字编号的**段数**：`1`→篇、`1.1`→章、`1.1.1`→节；无编号标题（REVIEW、正文开头、References）跳过
-- 一次 LLM 调用为所有编号 section 各生成**一句话**概要；篇概整范围、章概本章、节概本节
+- 层级：阿拉伯编号按**段数**（`1`→篇、`1.1`→章、`1.1.1`→节）；罗马 `I.`→1；字母 `A.`→2；无编号标题按顶层处理（`_numbered_depth` 与解析器、前端 secDepth 三处一致）
+- 一次 LLM 调用为所有标题各生成**一句话**概要；篇概整范围、章概本章、节概本节
 - 标题多时 `max_tokens` 按节数动态放大；漏生成的标题会补一轮
-- 前端左栏按 depth 缩进显示（目录式）
+- 前端左栏按 depth 缩进显示（目录式）；`is_references` 节跳过（其内容也不进 digest）
 
 ### 卡片定位数学（PdfViewer.blockTop）
 `cardTop = pageEl.getBoundingClientRect().top - railRect.top + block.y0 * pageScale + data.offset`
 - 拖拽松手 → 遍历所有块找最近锚点 → PATCH `{block_id, top, data.offset}`
-- 防重叠：术语卡与普通卡统一按锚定 top 排序依次下推（仅视觉，不改锚定）
+- 防重叠：普通卡、术语解释卡、未点击的术语小卡（`.term-chip`）一起按锚定 top 排序依次下推（仅视觉，不改锚定）；小卡在 `displayTops` 里用 `chip:<术语>` 作键
+- **术语小卡的锚点** = `terms[].refs[0]` 对应块。LLM 经常给不出 refs（术语所在块被 digest 截断时尤甚），refs 全空会让小卡一起挤在右轨顶部互相重叠，且点开解释时没有语境、退化成通用解释 → `summarize.locate_term_refs` 按「术语或其缩写」在原文首次出现处补齐（弯引号/连续空白归一化后再匹配）；`GET /api/papers/{id}` 与 `/analysis` 读取旧数据时也会补一次（refs 齐全则直接返回，不扫全文），所以旧论文不用重新生成导读就能恢复锚点
 
 ### API 一览
 ```
@@ -168,6 +173,7 @@ POST /api/papers/{id}/translate  {block_id} → {translation,page}
 POST /api/papers/{id}/term       {term,zh,refs} → 按需生成术语解释（按 term_depth 调详略）
 POST /api/papers/{id}/chat       {block_ids,history,question} → {answer,refs,pages,steps[]}（按 familiarity 调语气）
 GET/PUT /api/settings            base_url/api_key(掩码)/model/effort
+POST /api/settings/test          连通性自检：表单当前值未保存也可测，返回 ok/耗时/错误摘要
 POST /api/data/clear             一键清除全部本地数据（论文/卡片/档案/PDF；清 Key 保留模型配置）
 GET  /api/papers/{id}/profile    猜领域 + 同领域旧档案 + 本篇 meta
 POST /api/papers/{id}/survey     {domain,familiarity,known_terms,reuse} → meta
@@ -180,8 +186,10 @@ POST /api/papers/{id}/collect    {collected:bool}
 POST /api/papers/{id}/note       {note} → 论文备注
 GET  /api/papers/{id}/recommend  基于档案+历史+计划推荐 3 篇（带个性化理由）
 POST /api/review                 {paper_ids[]} ≥2篇 → 生成对比综述（带各篇 focus）
-POST /api/papers/{id}/quiz       全篇自测出题（2选择+1简答；按 familiarity 调难度）
-POST /api/papers/{id}/quiz/grade 简答按要点判分
+POST /api/papers/{id}/quiz       全篇自测出题（2选择+1简答；按 familiarity 调难度）→ 出题成功即入库覆盖旧题
+GET  /api/papers/{id}/quiz       取上次留存的自测 {questions, answers, grade}，前端打开面板先还原
+POST /api/papers/{id}/quiz/answers 保存未提交的作答（面板关闭时）
+POST /api/papers/{id}/quiz/grade 简答按要点判分，并把作答+判分结果写回 quiz
 ```
 
 ---
@@ -197,7 +205,7 @@ POST /api/papers/{id}/quiz/grade 简答按要点判分
 - 布局：导读置顶通栏 → 下滑进入阅读区
 
 ### 阶段二：核心交互
-- 段落点击 → 命中测试 → 浮动工具条（翻译/提问/通俗讲解）
+- 段落点击 → 命中测试 → 浮动工具条（翻译此段/就此段提问/问全文/通俗讲解）；「问全文」卡片 `block_ids:[]`+`global:true`，走 `_global_ctx`（导读+各节概要+目录），与顶栏「问全篇」同通道
 - 翻译卡（占位卡先显，译文返回后填充）
 - 子对话卡（多轮、`[bID]`引用、页码跳转、持久化、轻量 markdown）
 - 术语提取 + 点击成卡
@@ -246,7 +254,7 @@ POST /api/papers/{id}/quiz/grade 简答按要点判分
 - section 顺序按页面位置而非编号数字（个别子节顺序错位）
 - 首页上传同名论文不去重
 - Semantic Scholar 免费接口易 429 限流（arXiv 为主）
-- 计划/推荐/综述/自测为一次性面板，无历史留存
+- 计划/推荐/综述为一次性面板，无历史留存（自测已留存：重开面板显示上次题目/作答/成绩，「再测一次」才重新出题）
 - analyze 耗时波动（取决于 provider 负载）
 - `_discard` 后旧论文 structure 需重新上传才应用新解析
 

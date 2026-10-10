@@ -35,8 +35,9 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
   const dragged = useRef(false)
   const resize = useRef<{ startX: number; startW: number } | null>(null)
   const d = card.data
+  const isGlobalChat = card.type === 'chat' && !!d.global
   const title = card.type === 'translation' ? (d.pending ? '译文 · 翻译中…' : d.error ? '译文 · 失败' : `译文 · 第${d.page ?? '?'}页`)
-    : card.type === 'term' ? `术语 · ${d.term}` : '子对话'
+    : card.type === 'term' ? `术语 · ${d.term}` : isGlobalChat ? '子对话 · 🌐全文' : '子对话'
   // 收起时也显示一段预览，避免用户以为卡片是空的
   const preview = card.type === 'translation'
     ? (d.error ? `翻译失败：${d.error}` : d.pending ? '翻译中…' : (d.translation || d.orig || ''))
@@ -96,7 +97,7 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
     <div className={`card ${card.type}${active ? ' active' : ''}`} data-id={card.id} style={{ top, width }}
       onPointerDownCapture={onActivate}>
       <div className="ch" onPointerDown={down} onPointerMove={move} onPointerUp={up} onClick={clickHead}>
-        <span className="ico">{TYPE_ICON[card.type] ?? '📌'}</span>
+        <span className="ico">{isGlobalChat ? '🌐' : (TYPE_ICON[card.type] ?? '📌')}</span>
         <span className="ct">{title}</span>
         <button className="x toggle" title={open ? '收起' : '展开'} onClick={() => setOpen(!open)}>{open ? '▾' : '▸'}</button>
         {confirmDel ? (
@@ -135,7 +136,7 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
             </div>
           ))}
           <div className="ask">
-            <input value={q} placeholder={busy ? '思考中…' : '继续追问…'} disabled={busy}
+            <input value={q} placeholder={busy ? '思考中…' : isGlobalChat ? '就整篇论文提问…' : '继续追问…'} disabled={busy}
               onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && ask()} />
             <button className="btn small primary" onClick={ask} disabled={busy}>发送</button>
           </div>

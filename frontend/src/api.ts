@@ -66,6 +66,8 @@ export interface QuizResult {
   reference?: string
 }
 export interface QuizGrade { results: QuizResult[]; score: number; total: number }
+/** 入库的一次自测：题目 + 作答 + 判分结果（未判分时 grade 为 null） */
+export interface QuizSaved { questions: QuizQuestion[]; answers?: string[]; grade?: QuizGrade | null }
 
 const j = async (r: Response) => {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText)
@@ -84,6 +86,8 @@ export const api = {
   settings: (): Promise<LlmSettings> => fetch('/api/settings').then(j),
   saveSettings: (s: Partial<LlmSettings>): Promise<LlmSettings> =>
     fetch('/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s) }).then(j),
+  testSettings: (s: Partial<LlmSettings>): Promise<{ ok: boolean; model?: string; latency_ms?: number; reply?: string; error?: string }> =>
+    fetch('/api/settings/test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s) }).then(j),
   clearData: (): Promise<{ ok: boolean; papers_removed: number }> =>
     fetch('/api/data/clear', { method: 'POST' }).then(j),
   cards: (pid: string): Promise<Card[]> => fetch(`/api/papers/${pid}/cards`).then(j),
@@ -120,6 +124,10 @@ export const api = {
     fetch('/api/review', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paper_ids }) }).then(j),
   makeQuiz: (pid: string): Promise<{ questions: QuizQuestion[]; error?: string }> =>
     fetch(`/api/papers/${pid}/quiz`, { method: 'POST' }).then(j),
+  getQuiz: (pid: string): Promise<{ quiz?: QuizSaved | null }> =>
+    fetch(`/api/papers/${pid}/quiz`).then(j),
+  saveQuizAnswers: (pid: string, answers: string[]): Promise<{ ok: boolean }> =>
+    fetch(`/api/papers/${pid}/quiz/answers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ answers }) }).then(j),
   gradeQuiz: (pid: string, questions: QuizQuestion[], answers: string[]): Promise<QuizGrade> =>
     fetch(`/api/papers/${pid}/quiz/grade`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ questions, answers }) }).then(j),
 }

@@ -12,9 +12,18 @@ import QuizModal from './QuizModal'
 
 /** 标题数字编号的段数：1→1(篇)、1.1→2(章)、1.1.1→3(节)；无编号→0 */
 function secDepth(title: string): number {
-  const m = (title || '').match(/^\s*(\d+(?:\.\d+)*)\.?\s/)
-  return m ? m[1].split('.').length : 0
+  const t = (title || '').trim()
+  const m = t.match(/^(\d+(?:\.\d+)*)\.?\s/)
+  if (m) return m[1].split('.').length
+  // 罗马数字节（IEEE）：单字母（C./D./V.）正文须全大写才算罗马，否则是字母子节
+  const rm = t.match(/^([IVXLCDM]{1,7})\.\s+(.*)$/)
+  if (rm && (rm[1].length >= 2 || !/[a-z]/.test(rm[2]))) return 1
+  if (/^[A-Z]\.\s+[A-Za-z(]/.test(t)) return 2            // 字母编号子节
+  return 0
 }
+
+/** 未点击的术语小卡在 displayTops 里的键（与卡片 id 命名空间隔开） */
+const chipKey = (term: string) => `chip:${term}`
 
 export default function PaperView({ id }: { id: string }) {
   const [paper, setPaper] = useState<Paper | null>(null)
@@ -153,25 +162,35 @@ export default function PaperView({ id }: { id: string }) {
     }
   }, [cards, anchorTop, blockMap, visibleTerms])
   useEffect(() => { recompute() }, [recompute])
-  // 防重叠：按锚定 top 排序依次下推，写入独立的 displayTops（不覆盖锚点，避免与 recompute 互相覆盖）
+  // 防重叠：卡片与术语小卡一起按锚定 top 排序依次下推，写入独立的 displayTops
+  // （不覆盖锚点，避免与 recompute 互相覆盖）
   useLayoutEffect(() => {
     const el = rail.current
     if (!el) return
-    const items = [...el.querySelectorAll<HTMLElement>('.card')]
-      .filter((c) => !!c.dataset.id)
-      .map((c) => ({
-        id: c.dataset.id!, h: c.offsetHeight,
+    const items: { key: string; h: number; top: number }[] = []
+    const loose: { key: string; h: number }[] = []   // 锚点还没算出来的小卡，排队尾，避免全挤在 top=0
+    for (const c of el.querySelectorAll<HTMLElement>('.card, .term-chip')) {
+      if (c.dataset.id) {
         // 新卡片的 tops 还没写入时用内联 top 兜底，保证刚生成的卡片也立刻参与防重叠
-        top: tops[c.dataset.id!] ?? (c.dataset.term ? termTops[c.dataset.term] : (parseFloat(c.style.top) || 0)),
-      }))
-      .filter((it) => it.top != null)
-      .sort((a, b) => (a.top as number) - (b.top as number))
+        const top = tops[c.dataset.id] ?? (c.dataset.term ? termTops[c.dataset.term] : null) ?? parseFloat(c.style.top)
+        if (Number.isFinite(top)) items.push({ key: c.dataset.id, h: c.offsetHeight, top })
+      } else if (c.dataset.term) {
+        const top = termTops[c.dataset.term]
+        if (top != null) items.push({ key: chipKey(c.dataset.term), h: c.offsetHeight, top })
+        else loose.push({ key: chipKey(c.dataset.term), h: c.offsetHeight })
+      }
+    }
+    items.sort((a, b) => a.top - b.top)
     let prev = 0
     const next: Record<string, number> = {}
     for (const it of items) {
-      const t = Math.max(it.top as number, prev + 10)
-      next[it.id] = t
+      const t = Math.max(it.top, prev + 10)
+      next[it.key] = t
       prev = t + it.h
+    }
+    for (const it of loose) {
+      next[it.key] = prev + 10
+      prev += it.h + 10
     }
     let changed = Object.keys(next).length !== Object.keys(displayTops).length
     if (!changed) {
@@ -269,6 +288,15 @@ export default function PaperView({ id }: { id: string }) {
     if (question) askChat(c, question)
   }
 
+  // 全篇提问：不绑定具体段落（block_ids 为空 → 后端喂全文导读/开头画像 + 目录）。
+  // blockId 仅决定卡片锚在哪段旁边（工具条入口=点击的段落；顶栏入口=首个文字块），不进上下文
+  const addChatGlobal = async (blockId?: string) => {
+    setTool(null)
+    const anchor = blockId ?? blocks.find((b) => b.type === 'para' || b.type === 'heading')?.id
+    if (!anchor) return
+    await addCard('chat', anchor, { block_ids: [], messages: [], global: true })
+  }
+
   // 找到某术语背后已持久化的解释卡
   const termCard = useCallback((term: string): Card | undefined =>
     cards.find((c) => c.type === 'term' && c.data.term === term), [cards])
@@ -336,6 +364,7 @@ export default function PaperView({ id }: { id: string }) {
           {busy ? '导读生成中（约1分钟）…' : '生成全文导读'}</button>}
         {analysis && <button className="btn" onClick={analyze} disabled={busy}>{busy ? '生成中…' : '重新生成导读'}</button>}
         <button className="btn" onClick={() => setQuiz(true)}>全篇自测</button>
+        <button className="btn" onClick={() => addChatGlobal()} title="不绑定具体段落，让学伴基于全文导读与目录回答">问全篇</button>
         <button className="btn" disabled={recBusy} onClick={doRecommend}>
           {recBusy ? '推荐中…' : '推荐'}</button>
         <button className="btn" onClick={() => setSettings(true)}>设置</button>
@@ -419,7 +448,7 @@ export default function PaperView({ id }: { id: string }) {
             ))}
             {visibleTerms.map((t) => (
               <TermItem key={t.term} term={t.term} zh={t.zh}
-                top={(() => { const c = termCard(t.term); return c ? (displayTops[c.id] ?? tops[c.id] ?? termTops[t.term] ?? 0) : (termTops[t.term] ?? 0) })()}
+                top={(() => { const c = termCard(t.term); return c ? (displayTops[c.id] ?? tops[c.id] ?? termTops[t.term] ?? 0) : (displayTops[chipKey(t.term)] ?? termTops[t.term] ?? 0) })()}
                 card={termCard(t.term)}
                 onExpand={() => expandTerm(t)}
                 onCollapse={() => { const c = termCard(t.term); if (c) collapseTerm(c) }}
@@ -450,6 +479,7 @@ export default function PaperView({ id }: { id: string }) {
         <div className="toolbar-pop" style={{ left: Math.min(tool.x + 8, innerWidth - 220), top: tool.y + 8 }}>
           <button onClick={() => doTranslate(tool.blockId)}>🈶 翻译此段</button>
           <button onClick={() => addChat(tool.blockId)}>💬 就此段提问</button>
+          <button onClick={() => addChatGlobal(tool.blockId)} title="卡片仍锚在这段旁，但回答基于全文导读与目录，不局限于本段">🌐 问全文</button>
           <button onClick={() => addChat(tool.blockId, '用通俗的话讲讲这段在说什么')}> 通俗讲解</button>
         </div>
       )}

@@ -59,6 +59,9 @@ def paper(pid: str):
     if not p:
         raise HTTPException(404, "not found")
     p.pop("pdf_path", None)
+    if p.get("analysis"):
+        # 旧数据里术语可能没有 refs → 读取时按原文出现位置补齐，小卡才有锚点
+        summarize.locate_term_refs(p["analysis"].get("terms") or [], p["structure"])
     return p
 
 
@@ -106,7 +109,9 @@ def get_analysis(pid: str):
     p = db.get_paper(pid)
     if not p:
         raise HTTPException(404, "not found")
-    return p["analysis"] or {"elements": [], "outlines": [], "terms": []}
+    analysis = p["analysis"] or {"elements": [], "outlines": [], "terms": []}
+    summarize.locate_term_refs(analysis.get("terms") or [], p["structure"])
+    return analysis
 
 
 @app.get("/api/papers/{pid}/cards")
@@ -194,7 +199,8 @@ def chat(pid: str, body: ChatIn):
     m = db.get_meta(pid) or {}
     has_profile = bool(m.get("domain")) and bool(m.get("plan"))
     return ai.chat(p["structure"], body.block_ids, body.history, body.question,
-                   familiarity=m.get("familiarity") if has_profile else None)
+                   familiarity=m.get("familiarity") if has_profile else None,
+                   analysis=p.get("analysis"))
 
 
 # ---------------- 阶段三：档案 / 计划 / 检索 / 记忆 ----------------
@@ -375,14 +381,27 @@ def make_review(body: ReviewIn | None = None):
 
 # ---------------- 阶段四：全篇自测 ----------------
 
+@app.get("/api/papers/{pid}/quiz")
+def read_quiz(pid: str):
+    """上次做的自测（题目+作答+判分结果），供重新打开面板时还原。"""
+    if not db.get_paper(pid):
+        raise HTTPException(404, "not found")
+    return {"quiz": (db.get_meta(pid) or {}).get("quiz")}
+
+
 @app.post("/api/papers/{pid}/quiz")
 def make_quiz(pid: str):
+    """出一套新题并覆盖已存的自测（「再测一次」也走这里）。"""
     p = db.get_paper(pid)
     if not p:
         raise HTTPException(404, "not found")
     m = db.get_meta(pid) or {}
     has_profile = bool(m.get("domain")) and bool(m.get("plan"))
-    return quiz.make_quiz(p["structure"], p["analysis"], m.get("familiarity") if has_profile else None)
+    out = quiz.make_quiz(p["structure"], p["analysis"], m.get("familiarity") if has_profile else None)
+    if out.get("questions"):
+        db.upsert_meta(pid, quiz={"questions": out["questions"],
+                                  "answers": ["" for _ in out["questions"]], "grade": None})
+    return out
 
 
 class QuizGradeIn(BaseModel):
@@ -396,8 +415,23 @@ def grade_quiz(pid: str, body: QuizGradeIn):
     if not p:
         raise HTTPException(404, "not found")
     res = quiz.grade_quiz(p["structure"], body.questions, body.answers)
-    db.upsert_meta(pid, quiz_score=f"{res['score']}/{res['total']}")
+    db.upsert_meta(pid, quiz_score=f"{res['score']}/{res['total']}",
+                   quiz={"questions": body.questions, "answers": body.answers, "grade": res})
     return res
+
+
+class QuizAnswersIn(BaseModel):
+    answers: list[str]
+
+
+@app.post("/api/papers/{pid}/quiz/answers")
+def save_quiz_answers(pid: str, body: QuizAnswersIn):
+    """保存未提交的作答，下次打开面板接着做。"""
+    qz = (db.get_meta(pid) or {}).get("quiz")
+    if not qz:
+        return {"ok": False}
+    db.upsert_meta(pid, quiz={**qz, "answers": body.answers})
+    return {"ok": True}
 
 
 class Settings(BaseModel):
@@ -416,13 +450,26 @@ def get_settings():
     return cfg
 
 
+class SettingsTestIn(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+
+
+@app.post("/api/settings/test")
+def test_settings(body: SettingsTestIn | None = None):
+    """连通性自检：用表单当前值（未填/掩码项回落到已保存配置）发一次最小调用。"""
+    return llm.test_connection(body.model_dump() if body else None)
+
+
 @app.put("/api/settings")
 def put_settings(s: Settings):
     for k, v in s.model_dump(exclude_none=True).items():
-        if k == "api_key" and "****" in (v or ""):
-            continue  # 前端回显的掩码值不覆盖真实 key
+        if k == "api_key" and ("****" in (v or "") or v == "已设置"):
+            continue  # 前端回显的占位值不覆盖真实 key
         if v is not None and v != "":
             db.set_setting(f"llm_{k}", v)
+    llm.reset_capability_cache()   # 换了服务商/模型 → 重新探测 response_format 等参数支持
     return get_settings()
 
 

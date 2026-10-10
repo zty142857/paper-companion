@@ -232,6 +232,9 @@ a { color: var(--accent); text-decoration: none; }
 }
 .modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .err { color: #c23d3d; font-size: 12px; margin-top: 8px; }
+.test-res { font-size: 12px; margin-top: 8px; }
+.test-res.ok { color: #2e9e5b; }
+.test-res.fail { color: #c23d3d; }
 
 /* ---------- 阶段三：计划 / 推荐 / 综述 / 检索 / 步骤气泡 ---------- */
 .panels { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 14px; }

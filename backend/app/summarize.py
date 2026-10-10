@@ -11,21 +11,49 @@ PARA_CAP = 600
 
 
 def build_digest(structure: dict) -> tuple[str, dict]:
+    """把全文拼成给 LLM 的 digest。短文直接全文；超长文按**节**比例分配预算，
+    保证每个节都出现（至少首段），而不是从头累加到上限后把后半篇整段丢弃——
+    否则「实验/结论」等尾部节会完全缺席，导读要素与逐级概要只能编造或写"未提及"。"""
     blocks = {b["id"]: b for b in structure["blocks"]}
     sec_title = {s["id"]: s["title"] for s in structure["sections"]}
     ref_sec = {s["id"] for s in structure["sections"] if s["is_references"]}
-    lines, used = [], 0
-    for b in structure["blocks"]:
-        if b["type"] in ("figure", "formula"):
-            continue
-        if b["section_id"] in ref_sec:
-            continue  # 参考文献正文不进 digest
-        t = b["text"] if len(b["text"]) <= PARA_CAP else b["text"][:PARA_CAP] + "…"
-        line = f"[{b['id']}|第{b['page']}页|{sec_title.get(b['section_id'], '')}] {t}"
-        if used + len(line) > DIGEST_CHAR_BUDGET:
+    cand = [b for b in structure["blocks"]
+            if b["type"] not in ("figure", "formula") and b["section_id"] not in ref_sec]
+    groups: dict[str | None, list] = {}
+    for b in cand:
+        groups.setdefault(b["section_id"], []).append(b)   # dict 保序：按文档顺序
+
+    def prefix(b) -> str:
+        return f"[{b['id']}|第{b['page']}页|{sec_title.get(b['section_id'], '')}] "
+
+    def line(b, cap: int) -> str:
+        t = b["text"]
+        return prefix(b) + (t if len(t) <= cap else t[:cap] + "…")
+
+    full = {sid: sum(len(line(b, PARA_CAP)) + 1 for b in bs) for sid, bs in groups.items()}
+    total = sum(full.values())
+    if total <= DIGEST_CHAR_BUDGET:
+        return "\n".join(line(b, PARA_CAP) for bs in groups.values() for b in bs), blocks
+
+    MIN = 260          # 每个节至少保留的字符（其首段），确保无节被整段丢弃
+    pool = max(0, DIGEST_CHAR_BUDGET - MIN * len(groups))
+    lines = []
+    for sid, bs in groups.items():
+        share = MIN + pool * full[sid] / total
+        used = 0
+        for i, b in enumerate(bs):
+            whole = line(b, PARA_CAP)
+            if used + len(whole) + 1 <= share:
+                lines.append(whole)
+                used += len(whole) + 1
+                continue
+            room = int(share - used)
+            if i == 0:                       # 本节首段务必出现
+                room = max(room, MIN)
+            text_cap = room - len(prefix(b)) - 1
+            if text_cap >= 40:
+                lines.append(line(b, text_cap))
             break
-        lines.append(line)
-        used += len(line)
     return "\n".join(lines), blocks
 
 
@@ -44,18 +72,66 @@ def analyze(structure: dict, known_terms: list[str] | None = None, plan: dict | 
         return els
 
     # 三个生成步骤互不依赖，并行执行（LLM 调用为 IO 阻塞，线程池有效）
+    # 单个子任务失败只降级该部分，不让整份导读报废
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_el = ex.submit(elements_task)
         f_out = ex.submit(_gen_outlines, digest, structure, familiarity)
         f_term = ex.submit(_gen_terms, digest, known_terms or [], term_depth)
-        elements = f_el.result()
-        outlines = f_out.result()
-        terms = f_term.result()
+        try:
+            elements = f_el.result()
+        except Exception:
+            elements = [{"kind": k, "text": "（生成失败，可点顶部「重新生成导读」重试）",
+                         "refs": [], "pages": []} for k in ELEMENT_KINDS]
+        try:
+            outlines = f_out.result()
+        except Exception:
+            outlines = []
+        try:
+            terms = f_term.result()
+        except Exception:
+            terms = []
 
     for t in terms:
         t["refs"] = [r for r in t.get("refs", []) if r in valid]
+    locate_term_refs(terms, structure)
+    for t in terms:
         t["pages"] = sorted({b["page"] for b in structure["blocks"] if b["id"] in t["refs"]})[:3]
     return {"elements": elements, "outlines": outlines, "terms": terms}
+
+
+_ABBR_RE = re.compile(r"\(([^()]{1,10})\)")
+
+
+def _norm_term(s: str) -> str:
+    """术语匹配用的归一化：弯引号→直引号、连续空白（含 \xa0）→单个空格、转小写。"""
+    return re.sub(r"[\s\xa0]+", " ", s.replace("’", "'").replace("‘", "'")).lower().strip()
+
+
+def locate_term_refs(terms: list[dict], structure: dict) -> None:
+    """就地给 refs 为空的术语补一个「该词在原文里首次出现的块」。
+
+    LLM 经常给不出 refs（术语所在块被 digest 截断时尤其如此），而 refs 空会导致
+    右轨小卡没有锚点（全挤在顶部互相重叠）、点开解释时也没有语境（退化成通用解释）。
+    纯文本匹配，幂等，可在读取旧数据时重复调用。
+    """
+    if not terms or all(t.get("refs") for t in terms):
+        return                      # 常见情况：refs 齐全 → 不必扫全文（本函数在每次读论文时都会被调）
+    texts = [(b["id"], _norm_term(b.get("text") or "")) for b in structure.get("blocks") or []
+             if b.get("text")]
+    for t in terms:
+        if t.get("refs"):
+            continue
+        term = (t.get("term") or "").strip()
+        if not term:
+            continue
+        keys = [_norm_term(term)]
+        m = _ABBR_RE.search(term)
+        if m:
+            keys.insert(0, _norm_term(m.group(1)))   # 缩写更可能原样出现在正文里
+        for bid, txt in texts:
+            if any(k in txt for k in keys if k):
+                t["refs"] = [bid]
+                break
 
 
 def _plan_directive(plan: dict | None) -> str:
@@ -115,11 +191,19 @@ elements 必须按顺序包含这些 kind：{json.dumps(ELEMENT_KINDS, ensure_as
 
 
 def _numbered_depth(title: str) -> int | None:
-    """按标题数字编号的段数定层级：1→1(篇)、1.1→2(章)、1.1.1→3(节)。无编号返回 None。"""
-    m = re.match(r"^\s*(\d+(?:\.\d+)*)\.?\s", title or "")
-    if not m:
-        return None
-    return m.group(1).count(".") + 1
+    """按标题编号定层级：阿拉伯 1/1.1/1.1.1→1/2/3；罗马 I.→1；字母 A.→2。无编号返回 None。
+
+    单字母（C./D./V.）既是罗马数字又是 IEEE 子节字母：正文全大写才按罗马算，否则按字母子节。"""
+    t = (title or "").strip()
+    m = re.match(r"^(\d+(?:\.\d+)*)\.?\s", t)
+    if m:
+        return m.group(1).count(".") + 1
+    rm = re.match(r"^([IVXLCDM]{1,7})\.\s+(.*)$", t)
+    if rm and (len(rm.group(1)) >= 2 or not re.search(r"[a-z]", rm.group(2))):
+        return 1
+    if re.match(r"^[A-Z]\.\s+[A-Za-z(]", t):
+        return 2
+    return None
 
 
 def _gen_outlines(digest: str, structure: dict, familiarity: str | None = None) -> list[dict]:

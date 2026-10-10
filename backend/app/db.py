@@ -60,7 +60,7 @@ def init():
         CREATE TABLE IF NOT EXISTS paper_meta(
           paper_id TEXT PRIMARY KEY, domain TEXT, familiarity TEXT,
           known_terms TEXT, plan TEXT, note TEXT, quiz_score TEXT, visited INTEGER, collected INTEGER, updated_at REAL,
-          domain_guess TEXT, dismissed_terms TEXT);
+          domain_guess TEXT, dismissed_terms TEXT, quiz TEXT);
         """)
         # 轻量迁移：旧库补列
         cols = {r[1] for r in c.execute("PRAGMA table_info(paper_meta)")}
@@ -72,6 +72,8 @@ def init():
             c.execute("ALTER TABLE paper_meta ADD COLUMN domain_guess TEXT")
         if "dismissed_terms" not in cols:
             c.execute("ALTER TABLE paper_meta ADD COLUMN dismissed_terms TEXT")
+        if "quiz" not in cols:
+            c.execute("ALTER TABLE paper_meta ADD COLUMN quiz TEXT")
 
 
 def new_pending(filename) -> str:
@@ -181,7 +183,7 @@ def delete_paper(pid) -> str | None:
 
 def _row_meta(r) -> dict:
     d = dict(r)
-    for k in ("known_terms", "dismissed_terms", "plan", "domain_guess"):
+    for k in ("known_terms", "dismissed_terms", "plan", "domain_guess", "quiz"):
         d[k] = json.loads(d[k]) if d.get(k) else ([] if k in ("known_terms", "dismissed_terms") else None)
     return d
 
@@ -218,18 +220,19 @@ def upsert_meta(pid, **fields):
     cur = get_meta(pid) or {}
     merged = {**{k: cur.get(k) for k in
                  ("domain", "familiarity", "known_terms", "plan", "note", "quiz_score",
-                  "visited", "collected", "domain_guess", "dismissed_terms")}, **fields}
+                  "visited", "collected", "domain_guess", "dismissed_terms", "quiz")}, **fields}
     with conn() as c:
         c.execute("INSERT OR REPLACE INTO paper_meta"
-                  "(paper_id,domain,familiarity,known_terms,plan,note,quiz_score,visited,collected,updated_at,domain_guess,dismissed_terms)"
-                  " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "(paper_id,domain,familiarity,known_terms,plan,note,quiz_score,visited,collected,updated_at,domain_guess,dismissed_terms,quiz)"
+                  " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (pid, merged.get("domain"), merged.get("familiarity"),
                    json.dumps(merged.get("known_terms") or [], ensure_ascii=False),
                    json.dumps(merged.get("plan"), ensure_ascii=False) if merged.get("plan") else None,
                    merged.get("note"), merged.get("quiz_score"),
                    1 if merged.get("visited") else 0, 1 if merged.get("collected") else 0, time.time(),
                    json.dumps(merged.get("domain_guess"), ensure_ascii=False) if merged.get("domain_guess") else None,
-                   json.dumps(merged.get("dismissed_terms") or [], ensure_ascii=False)))
+                   json.dumps(merged.get("dismissed_terms") or [], ensure_ascii=False),
+                   json.dumps(merged.get("quiz"), ensure_ascii=False) if merged.get("quiz") else None))
     return get_meta(pid)
 
 
