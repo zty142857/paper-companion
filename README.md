@@ -1,0 +1,285 @@
+# 论文阅读智能学伴
+
+一个帮你**高效读论文**的本地 Web 应用：上传 PDF 后自动生成全文导读与章节概要，支持在原版面上翻译 / 提问 / 查术语，读完后还能自测，并把读过、收藏的论文串成推荐与综述。
+
+> 所有数据（论文、笔记、卡片）都保存在**你自己的电脑**上。只有调用 AI 功能时，相关论文片段会发送到你配置的模型服务商。
+
+**不想装环境？** 到 [Releases](releases) 下载对应系统的压缩包，解压后双击启动脚本即可，**不需要安装 Python 或 Node**（见 [第 2 节](#2-快速开始下载即用)）。
+
+## 目录
+1. [功能一览](#1-功能一览)
+2. [快速开始（下载即用）](#2-快速开始下载即用)
+3. [第一次使用：配置模型](#3-第一次使用配置模型)
+4. [各功能怎么用](#4-各功能怎么用)
+5. [从源码运行](#5-从源码运行)
+6. [常见问题](#6-常见问题)
+7. [隐私与数据](#7-隐私与数据)
+8. [项目结构](#8-项目结构)
+
+---
+
+## 1. 功能一览
+
+| 功能 | 说明 |
+|---|---|
+| **上传论文** | 拖拽或点击上传 PDF，自动解析标题、章节、段落（约 5–15 秒），单栏双栏都能读 |
+| **摸底问卷** | 上传后自动弹窗：识别论文领域，问你熟悉度、勾选已懂术语 |
+| **阅读计划** | 根据你的画像生成可调整的阅读计划（重点关注 / 建议略读 / 阅读建议） |
+| **全文导读** | 六要素（一句话总览 / 研究问题 / 方法 / 创新点 / 实验与结果 / 局限），带页码可点击跳转，并做事实自查 |
+| **章节概要** | 左栏目录式列出「篇 / 章 / 节」，每项一句话概要 |
+| **原版面精读** | pdf.js 渲染原始 PDF，可选中复制；缩放滑块，>170% 可左右滑动 |
+| **段落翻译** | 点击任意段落 → 翻译成中文（术语保留英文 + 白话注释），带上下文更贴合原意 |
+| **子对话** | 对某段提问，回答带 `[块ID]` 出处；话题涉及外部 / 最新进展时会自主检索 arXiv |
+| **问全篇 / 问全文** | 顶栏「问全篇」或段落工具条「问全文」：不局限于一段，基于全文导读 + 各节概要 + 目录回答"创新点是什么""各章怎么支撑结论"这类全局问题 |
+| **术语卡** | 右轨琥珀色小卡标出未看过的术语，锚在术语出现的段落旁，点击展开为贴合论文语境的解释卡 |
+| **卡片锚定** | 翻译 / 对话 / 术语卡可拖拽重新锚定到段落旁，可调整宽度、折叠、删除 |
+| **文献检索** | 直接在应用内检索 arXiv / Semantic Scholar |
+| **收藏与记忆** | 收藏论文进文献库；已懂术语跳过；推荐基于你的阅读历史 |
+| **文献综述** | 主页勾选 ≥2 篇论文，一键生成对比综述 |
+| **全篇自测** | 读完后出 2 选择题 + 1 简答题，错题可跳回原文；题目与作答会留存，重开接着做 |
+| **隐私与数据** | 查看数据说明，一键清除全部本地数据 |
+
+---
+
+## 2. 快速开始（下载即用）
+
+1. 到 [Releases](releases) 下载对应你系统的包：
+
+   | 你的系统 | 下载文件 |
+   | --- | --- |
+   | Windows 64 位 | `paper-companion-win-x64.zip` |
+   | macOS Apple 芯片（M1/M2/M3/M4） | `paper-companion-macos-arm64.zip` |
+   | macOS Intel 芯片 | `paper-companion-macos-x64.zip` |
+   | Linux 64 位 | `paper-companion-linux-x64.tar.gz` |
+
+2. **解压**（不要直接在压缩包里双击运行）。
+3. 启动：
+   - Windows：双击 `start.bat`
+   - macOS：右键 `start.command` →「打开」→ 再点一次「打开」（未做苹果签名，首次会被拦截）
+   - Linux：双击 `start.sh`，或终端执行 `./start.sh`
+4. 浏览器会自动打开（默认 `http://127.0.0.1:8765`，端口被占用会自动换一个，以窗口里打印的地址为准）。
+5. 按[第 3 节](#3-第一次使用配置模型)配置模型，然后就可以上传 PDF 了。
+
+论文、卡片、设置全部存在解压目录下的 `data/` 里，**升级时只需替换程序文件、保留 `data/` 文件夹**。
+
+---
+
+## 3. 第一次使用：配置模型
+
+应用本身不含 API Key，需要你自备一个**兼容 OpenAI 接口**的模型服务。
+
+### 支持的服务
+任何 OpenAI 兼容接口都可以，例如：
+- 阿里云 DashScope（默认）：`https://dashscope.aliyuncs.com/compatible-mode/v1`，模型如 `qwen3.8-flash`
+- DeepSeek、Moonshot、智谱、OpenAI、本地 Ollama / vLLM 等
+
+### 配置步骤
+1. 打开应用，点右上角「**模型设置**」。
+2. 填写：
+   - **Base URL**：服务商的 OpenAI 兼容地址
+   - **API Key**：你的密钥（保存在本机，回显时打码）
+   - **模型名**：如 `qwen3.8-flash`
+   - **思考强度**：低 / 中 / 高（影响速度与质量；部分模型不支持会自动降级）
+3. 点「**测试连接**」——会用你填的内容真实发一次极短请求，成功显示耗时与模型回词，失败直接把服务商的报错显示出来，省得填错了要到生成导读时才发现。
+4. 保存。
+
+> 源码运行时也可以在 `backend/.env` 里预置 `LLM_API_KEY` 等配置（优先级低于网页里填的）。
+
+---
+
+## 4. 各功能怎么用
+
+### 4.1 上传与摸底
+- 首页把 PDF 拖到虚线框，或点击选择文件。
+- 进入工作台后**自动弹出摸底问卷**：确认 / 修改领域 → 选熟悉度（新手 / 进阶 / 熟手）→ 勾选已懂术语 → 提交。
+- 同领域论文会显示「沿用上次摸底」。
+
+### 4.2 生成导读
+- 完成摸底后会**自动生成阅读计划**；在计划卡上勾选调整后点「**按此计划进行**」，应用会**自动生成导读**（含章节概要、术语）。
+- 也可以直接点顶部「**重新生成导读**」手动生成（不套用画像）。
+- 导读里每条要素带页码按钮，点击跳到对应页；标了「✓ 已自查」的要素是模型对照原文核对过的。
+
+### 4.3 精读与互动
+- 在 PDF 区域**点击任意段落** → 弹出工具条：翻译此段 / 就此段提问 / 问全文 / 通俗讲解。
+- 「问全文」生成的卡片带 🌐 标记：虽然锚在你点的那段旁，但回答**基于整篇论文**（全文导读 + 各节概要 + 目录），适合问"创新点是什么""各章怎么支撑结论"这类全局问题；细节问题仍用「就此段提问」。顶栏「问全篇」是同一功能的无锚点入口。
+- 生成的卡片出现在右侧轨道，**拖动卡片头**可重新锚定到别的段落；拖右边缘可改宽度；✕ 删除（有确认）。
+- 子对话可多轮追问；回答里的 `[块ID]` 表示出处，页码按钮可跳转。
+
+### 4.4 术语
+- 右轨列出术语：没看过的显示为琥珀色小卡，**锚在该术语出现的段落旁边**，多张挤在一起时会自动依次下排、互不遮挡。
+- 点击小卡就地展开成解释卡（此时才真正调用模型生成，贴合本论文语境）。
+- 小卡 / 解释卡上的 ✕ 可隐藏该术语（**只对本篇生效**，存在本机）；想让同领域论文都不再提示，去「摸底问卷」里把它勾成已懂。
+
+### 4.5 检索 / 推荐 / 综述
+- 导读区下方检索框可搜 arXiv / Semantic Scholar。
+- 顶部「**推荐**」按你的阅读历史推荐 3 篇。
+- 主页「**文献综述**」→ 勾选 ≥2 篇 → 生成对比综述。
+
+### 4.6 全篇自测
+- 滚到全文末尾会出现提示条，或点顶部「**全篇自测**」。
+- 做完提交判分，错题会显示正确答案、解析和「回原文」按钮。
+- **题目会留存**：再次点开自测，显示的是上次那套题——没提交的话你的作答还在，可以接着做；已判分的话直接回看成绩与解析。
+- 想换一套题：点「**再测一次**」重新出题（会覆盖当前题目与成绩，出题约 20 秒）。
+
+---
+
+## 5. 从源码运行
+
+想改代码、或系统没有对应的安装包时，按系统（Windows / WSL / Linux / macOS）装依赖后用 `start.sh` 一键起（前端 `:5173`、后端 `:8000`）。
+
+### 通用前置要求
+- **Node.js ≥ 20.19 或 ≥ 22.12**（Vite 8 要求；版本太低会导致页面打不开）
+- **Python 3.14** + 包管理器 [uv](https://docs.astral.sh/uv/)（推荐），或系统 pip
+- 能联网（首次装依赖 + 调用模型）
+
+### 5.1 Linux
+
+```bash
+# 1. 安装 Node（建议用 nvm）
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc && nvm install 22 && nvm use 22
+
+# 2. 安装 uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"     # 或加入 ~/.bashrc
+
+# 3. 装依赖
+cd paper-companion
+uv venv backend/.venv --python 3.14
+uv pip install -p backend/.venv fastapi "uvicorn[standard]" pymupdf httpx openai python-multipart
+cd frontend && npm install && npm install pdfjs-dist @rolldown/binding-linux-x64-gnu && cd ..
+
+# 4. 启动
+bash start.sh
+# 打开浏览器访问 http://127.0.0.1:5173
+```
+
+### 5.2 macOS
+
+```bash
+# 1. 安装 Homebrew（若没有）后装 Node 与 uv
+brew install node uv
+
+# 2. 装依赖
+cd paper-companion
+uv venv backend/.venv --python 3.14
+uv pip install -p backend/.venv fastapi "uvicorn[standard]" pymupdf httpx openai python-multipart
+cd frontend && npm install && cd ..
+
+# 3. 启动
+bash start.sh
+```
+> Apple Silicon 一般无需手动补 rolldown binding；若 `npm run dev` 报缺少 binding，执行 `npm install @rolldown/binding-darwin-arm64`（Intel 用 `-darwin-x64`）。
+
+### 5.3 Windows（推荐用 WSL2）
+
+**方式 A：WSL2（推荐，最省心）**
+1. 管理员 PowerShell 执行 `wsl --install`，装好 Ubuntu 后进入 WSL。
+2. 在 WSL 里按上面 [5.1 Linux](#51-linux) 的步骤操作。
+3. 启动后，在 **Windows 的浏览器**里访问 `http://127.0.0.1:5173`（WSL2 默认端口会被转发，通常可直接访问）。
+4. 代码建议放在 WSL 文件系统（如 `~/paper-companion`）而非 `/mnt/c/...`，速度更快。
+
+**方式 B：原生 Windows（PowerShell）**
+```powershell
+# 1. 安装 Node（官网 LTS，或 winget install OpenJS.NodeJS）与 uv（winget install astral-sh.uv）
+# 2. 装依赖
+cd paper-companion
+uv venv backend\.venv --python 3.14
+uv pip install -p backend\.venv fastapi "uvicorn[standard]" pymupdf httpx openai python-multipart
+cd frontend; npm install; cd ..
+
+# 3. 分别起后端和前端（start.sh 是 bash 脚本，Windows 下用两条命令）
+# 后端（新开一个 PowerShell 窗口）
+backend\.venv\Scripts\uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+# 前端（再开一个窗口）
+cd frontend; npm run dev -- --host 127.0.0.1
+```
+然后浏览器访问 `http://127.0.0.1:5173`。
+> 若缺 rolldown binding：`npm install @rolldown/binding-win32-x64-msvc`。
+
+### 5.4 一键启动脚本 `start.sh`
+```bash
+bash start.sh     # 检查依赖 → 关掉旧后端 → 起后端 → 起前端
+```
+- 日志：`/tmp/pc-backend.log`、`/tmp/pc-frontend.log`
+- 停止：`pkill -f '[u]vicorn app.main'` 和 `pkill -f vite`
+- 改了**后端**要重启后端；改了**前端** Vite 会自动热更新。
+
+### 5.5 打安装包（可选）
+```bash
+python packaging/build.py --target win-x64      # 或 linux-x64 / macos-x64 / macos-arm64
+```
+产物在 `release/`。推 `v*` tag 会由 GitHub Actions 自动在四个平台上构建并发布到 Releases。
+
+---
+
+## 6. 常见问题
+
+**Q：浏览器打不开 / 页面空白？**
+源码运行时先确认 Node 版本（`node -v` ≥ 20.19 / 22.12）。旧版 Node 会让 Vite 启动但不监听端口，可用 `ss -ltnp | grep 5173` 看端口是否在监听。用打包版则检查启动窗口里打印的地址。
+
+**Q：报「未配置 API Key」？**
+到「模型设置」填 Base URL / Key / 模型名，点「测试连接」确认能通。
+
+**Q：生成导读很慢或失败？**
+导读会并行发起多个模型请求（六要素 / 各节概要 / 术语，外加一次事实自查），耗时约 30–110 秒，取决于服务商负载。失败时**只有那一部分降级**，其余照常显示，可点「重新生成导读」重试；或在设置里把思考强度调低。
+
+**Q：某篇论文的章节划分不对 / 没分出章节？**
+应用按标题行的编号与样式（阿拉伯 / 罗马 / 字母、字号、加粗）判定标题，并会识别双栏版式。我们用它回归过 16 篇论文（IEEE、arXiv、SAGE、LNCS / ICLR 等模板混测），绝大多数都能正确分章。个别极端版式（扫描图片型 PDF、标题与正文同字号且无编号）可能漏分，这类情况欢迎带 PDF 反馈。
+
+**Q：上传后没有章节概要 / 术语？**
+需先完成摸底 + 确认阅读计划（或手动点「重新生成导读」）。
+
+**Q：术语小卡太多挡住右轨？**
+小卡会自动依次下排不互相重叠；不想看的术语点 ✕ 永久隐藏，或在摸底里勾选为已懂。
+
+**Q：自测题目每次重开都换一套？**
+不会。题目、作答与成绩都会存在本机，重开面板显示上次那套；要换题请点「再测一次」。
+
+**Q：想重新开始？**
+主页「隐私与数据 → 一键清除全部数据」，会删除所有论文 / 卡片 / 档案 / PDF 并清除已保存的 Key。
+
+**Q：`npm run build` 报找不到 rolldown binding？**
+npm 可选依赖的已知 bug，手动补装对应平台的包（见上面各系统说明）。
+
+---
+
+## 7. 隐私与数据
+
+应用首页「**隐私与数据**」按钮内也有以下说明：
+
+- **数据存储**：论文原文、导读 / 术语 / 卡片、阅读计划、笔记，全部存在**本机**——打包版在程序目录下的 `data/`（SQLite + PDF），源码运行在 `backend/data/`。不上传到本应用以外的服务器，数据目录权限已收紧为仅当前用户可读。
+- **模型调用**：生成导读、翻译、术语解释、子对话、自测时，会把**相关论文正文片段与你的提问**发送到你配置的模型服务商用于推理。请仅上传你有权处理的论文，并留意服务商的隐私政策。
+- **API Key**：仅存本机（数据库或 `backend/.env`，权限 600），不回显明文、不写日志、不对外发送（仅用于调用你配置的模型）。
+- **你的权利**：可逐篇删除论文，或「一键清除全部数据」。
+
+> 把压缩包分享给他人时：删掉 `data/app.db`（打包版）或 `backend/.env`（源码），对方按第 3 节自行配置即可。仓库 `.gitignore` 已忽略 `data/`、`backend/data/` 与 `.env`。
+
+---
+
+## 8. 项目结构
+
+```
+paper-companion/
+├─ backend/            # FastAPI 后端
+│  └─ app/
+│     ├─ pdf_parse.py    # PDF → 块 / 章节（行级标题判定、双栏检测）
+│     ├─ summarize.py    # 全文导读、各节概要、术语、digest 预算分配
+│     ├─ ai.py           # 翻译 / 子对话 / 术语解释（含全篇上下文）
+│     ├─ quiz.py         # 自测出题与要点判分
+│     ├─ profile.py      # 领域档案、阅读计划、推荐、综述
+│     ├─ llm.py          # OpenAI 兼容客户端（参数降级、重试、能力探测）
+│     ├─ search.py       # arXiv / Semantic Scholar 检索
+│     └─ main.py         # API 路由
+├─ frontend/           # React + Vite
+│  └─ src/
+│     ├─ PaperView.tsx     # 工作台：导读 / 目录 / 右轨卡片 / 工具条
+│     ├─ PdfViewer.tsx     # pdf.js 渲染与块坐标换算
+│     ├─ CardItem.tsx      # 翻译 / 对话 / 术语卡
+│     ├─ TermItem.tsx      # 术语小卡 → 解释卡
+│     ├─ QuizModal.tsx     # 全篇自测
+│     └─ Home.tsx / SettingsModal.tsx / ProfileModal.tsx / PlanCard.tsx
+├─ packaging/build.py  # 四平台打包（PyInstaller）
+├─ .github/workflows/  # 推 tag 自动构建并发布 Releases
+└─ start.sh            # 开发模式一键启动
+```
