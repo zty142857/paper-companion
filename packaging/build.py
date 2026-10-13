@@ -105,10 +105,17 @@ def detect_target() -> str:
     return "linux-arm64" if machine in ("arm64", "aarch64") else "linux-x64"
 
 
+def ensure_pdfjs_wasm() -> None:
+    """pdf.js 的 CCITT/JBIG2 扫描图解码器是 WASM 裸文件，vite 不会打包，必须复制进
+    dist/wasm/，否则整页扫描件渲染不出来。PyInstaller 整目录收 dist，会一并带上。"""
+    run(["node", os.path.join("scripts", "copy-pdfjs-wasm.mjs")], cwd=FRONTEND)
+
+
 def build_frontend(skip: bool) -> None:
     if skip:
         if not os.path.isdir(os.path.join(FRONTEND, "dist")):
             raise SystemExit("frontend/dist 不存在，不能使用 --skip-npm")
+        ensure_pdfjs_wasm()
         return
     has_lock = os.path.isfile(os.path.join(FRONTEND, "package-lock.json"))
     npm = "npm.cmd" if os.name == "nt" else "npm"

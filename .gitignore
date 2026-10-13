@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# pdf.js WASM 解码器，由 frontend/scripts/copy-pdfjs-wasm.mjs 从 node_modules 复制，不入库
+frontend/public/wasm/
 .venv/
 .venv-win/
 __pycache__/

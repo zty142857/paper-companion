@@ -39,6 +39,17 @@ const MIN_SCALE = 0.3
 const MAX_SCALE = 4
 // 首次进入时的兜底缩放；实际显示比例会在文档加载后按阅读区宽度自动适配。
 const DEFAULT_SCALE = 1.7
+// pdf.js 6 起 CCITT/JBIG2/JPEG2000 位图解码器在 WASM 里，缺文件时 render 既不 resolve
+// 也不 reject，会把整篇渲染循环永久卡死。拼接规则是 `${wasmUrl}${filename}`，必须带尾斜杠。
+const WASM_URL = new URL('wasm/', document.baseURI).href
+// 首次调用 WASM 解码器要编译模块，扫描件首屏可能几十秒（实测后台标签页里 73s，
+// 之后每页都在百毫秒级）。所以超时只用来提示"渲染中"，绝不 cancel——取消会让这一页永久空白。
+const RENDER_SLOW_MS = 15000
+
+function renderPage(page: any, opts: any, slowMs: number, onSlow: () => void): Promise<void> {
+  const timer = window.setTimeout(onSlow, slowMs)
+  return page.render(opts).promise.finally(() => clearTimeout(timer))
+}
 
 export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout }: Props) {
   const box = useRef<HTMLDivElement>(null)
@@ -70,7 +81,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     wrap.innerHTML = ''
     pageEls.current = new Map()
       setErr('')
-    pdfjs.getDocument({ url }).promise.then(async (doc) => {
+    pdfjs.getDocument({ url, wasmUrl: WASM_URL }).promise.then(async (doc) => {
       if (dead) return
       const first = await doc.getPage(1)
       baseW.current = first.getViewport({ scale: 1 }).width
@@ -82,6 +93,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
           return
         }
       }
+      const failed: number[] = []
       for (let i = 1; i <= doc.numPages; i++) {
         if (dead) return
         const page = await doc.getPage(i)
@@ -106,17 +118,36 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
         div.appendChild(tag)
         wrap.appendChild(div)
         pageEls.current.set(i, { el: div, scale })
-        await page.render({
-          canvasContext: canvas.getContext('2d')!, viewport: vp,
-          transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
-        } as any).promise
-        const tl = new pdfjs.TextLayer({
-          textContentSource: await page.streamTextContent(), container: tlDiv, viewport: vp,
-        })
-        await tl.render()
-        textLayers.current.push(tl)
+        const note = document.createElement('div')
+        try {
+          await renderPage(page, {
+            canvasContext: canvas.getContext('2d')!, viewport: vp,
+            transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+          } as any, RENDER_SLOW_MS, () => {
+            note.className = 'page-note'
+            note.textContent = `第 ${i} 页正在渲染（扫描件首次解码较慢，请稍候）`
+            div.appendChild(note)
+          })
+        } catch (e) {
+          failed.push(i)
+          note.className = 'page-fail'
+          note.textContent = `第 ${i} 页渲染失败：${String((e as Error)?.message || e)}`
+          div.appendChild(note)
+        }
+        note.remove()   // 成功或失败都撤掉"渲染中"提示
+        try {
+          const tl = new pdfjs.TextLayer({
+            textContentSource: await page.streamTextContent(), container: tlDiv, viewport: vp,
+          })
+          await tl.render()
+          textLayers.current.push(tl)
+        } catch { /* 文字层失败不影响图像展示 */ }
       }
       pdfjs.TextLayer.cleanup()
+      if (failed.length && !dead) {
+        const shown = failed.slice(0, 6).join('、')
+        setErr(`${failed.length}/${doc.numPages} 页渲染失败（第 ${shown}${failed.length > 6 ? ' 等' : ''} 页），其余页正常`)
+      }
       onLayout?.()
     }).catch((e) => { if (!dead) setErr(String(e?.message || e)) })
     return () => {

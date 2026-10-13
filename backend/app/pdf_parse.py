@@ -55,6 +55,17 @@ REF_ENTRY_RE = re.compile(
 URL_RE = re.compile(r"(https?://|www[.:]|\.(com|org|net|edu|gov)\b)", re.I)
 # "LeCun, Y., Boser, B." / "Anderson V."式姓名列表开头 → 文献条目，不是标题
 NAME_HEAD_RE = re.compile(r"^[A-Z][a-zA-Z'\-]{1,12}[,.]?\s+[A-Z]\.[,\s]")
+# 编号式参考文献条目："(23) Eisenbraun, E. J.; …" / "[12] Smith, J. A."。
+# 扫描件的 OCR 文字层常把整条引用标成粗体，此时"加粗"不可信，必须靠这个形态挡掉。
+REF_AUTHOR_RE = re.compile(r"^\s*[\[(]\d{1,3}[\])]\.?\s+[A-Z][a-zA-Z'\-]{1,15},\s+[A-Z]\.")
+# 跨学科通用章节名：这些词几乎只作为章节标题出现，即使与正文同字号、不加粗也算。
+GENERIC_HEAD_RE = re.compile(
+    r"^(?:abstract|introduction|background|related\s+work|motivation|"
+    r"preliminar(?:y|ies)|method(?:s|ology)?|materials?\s+and\s+methods?|"
+    r"experimental\s+section|experiments?|results?(?:\s+(?:and|/)\s+discussion)?|"
+    r"discussion|evaluation|implementation|conclusions?|future\s+work|limitations?|"
+    r"references?|supporting\s+information|supplementary\s+\w+)"
+    r"\b", re.I)
 # 文中带 [12] 编号引用标记的短行多为表格列/图例，不是章节标题
 CITATION_RE = re.compile(r"\[\d{1,3}\]")
 # 作者单位/联系信息，不是章节标题
@@ -232,7 +243,7 @@ def _classify_head_line(text: str, size: float, bold: bool, italic: bool,
         return None
     if URL_RE.search(text):
         return None
-    if REF_ENTRY_RE.search(text) or CAPTION_RE.match(text) or AFFIL_RE.search(text):
+    if REF_ENTRY_RE.search(text) or REF_AUTHOR_RE.match(text) or CAPTION_RE.match(text) or AFFIL_RE.search(text):
         return None
     if CITATION_RE.search(text):
         return None  # 行内含 "[12]" 式引用标记 → 参考文献/图注内容
@@ -280,6 +291,8 @@ def _bold_runin(line: dict) -> tuple[str, dict] | None:
         return None
     if not re.match(r"[A-Z(\d]", tail_txt) or RUNIN_STOPWORDS_RE.match(prefix):
         return None
+    if REF_AUTHOR_RE.match(prefix):
+        return None  # "(23) Eisenbraun, E." 式参考文献条目（OCR 常整条加粗，粗体不可信）
     body = prefix.rstrip(".:")
     if CAPTION_RE.match(body) or not (_titlecased(body) or _upper_dominant(body)):
         return None
@@ -635,6 +648,24 @@ def parse_pdf(path: str) -> dict:
                  for ln in b["lines"] if ln.get("spans")]
     all_sizes = [s for s in all_sizes if s > 0]
     body_size = statistics.median(all_sizes) if all_sizes else 10
+    # 页眉/页脚（running head）：跨页重复出现在页面上下窄带内的行。它们字号与正文接近、
+    # 又常是 Title Case 的论文标题片段（"Stereoselective Total Synthesis of Artemisinin"），
+    # 极易被当成章节标题，还会污染翻译与提问的上下文 → 整行剔除。
+    band: dict[str, set] = {}
+    for pno, (_w, h, d) in enumerate(pages_data):
+        for b in d["blocks"]:
+            if b["type"] != 0:
+                continue
+            for ln in b.get("lines") or []:
+                if not ln.get("spans"):
+                    continue
+                y = ln["bbox"][1]
+                if h * 0.06 < y < h * 0.93:
+                    continue  # 正文区，不参与页眉统计
+                t = _line_of(ln)["text"]
+                if t:
+                    band.setdefault(re.sub(r"\d+", "#", t)[:80], set()).add(pno)
+    running = {k for k, v in band.items() if len(v) >= 3}
 
     for pno, (w, h, d) in enumerate(pages_data):
         raw = pages_raw[pno][1]
@@ -650,7 +681,13 @@ def parse_pdf(path: str) -> dict:
             covered = {c for c in doc_centers for x, _ in paras if abs(x - c) <= 30}
             if full_frac < 0.5 and len(covered) >= 2:
                 cols = _bounds_from_centers(sorted(covered), w)
-        figure_boxes = [b["bbox"] for b in raw if b["type"] == 1]
+        # 扫描版 PDF 的整页背景图（覆盖页面 ≥85%）不是"图"，它就是页面本身。
+        # 不剔除的话 _inside_figure 会把页面上每个文本块都判成"图内标注"，
+        # 于是所有无编号章节标题被系统性否决。
+        page_area = max(w * h, 1e-6)
+        figure_boxes = [b["bbox"] for b in raw if b["type"] == 1
+                        and (b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1])
+                        / page_area < 0.85]
         items = []  # (col, y0, kind, text, bbox, size, level, weak)
         for b in raw:
             cx = (b["bbox"][0] + b["bbox"][2]) / 2
@@ -660,6 +697,9 @@ def parse_pdf(path: str) -> dict:
                 items.append((col, b["bbox"][1], "figure", "", b["bbox"], 0.0, None, False))
                 continue
             lines = _clean_lines(b, body_size)
+            if running:
+                lines = [ln for ln in lines
+                         if re.sub(r"\d+", "#", ln["text"])[:80] not in running]
             if not lines:
                 continue
             top_zone = pno == 0 and lines[0]["bbox"][1] < h * 0.30  # 首页标题/作者/机构区
@@ -696,10 +736,14 @@ def parse_pdf(path: str) -> dict:
                 upperish = bool(UPPER_HEAD_RE.fullmatch(text)) and not any(c.isdigit() for c in text)
                 # 无编号"全大写+样式"弱兜底（表格列头也常命中）→ 标记 weak，排序后按栏内留白复核；
                 # plain（字号略大于正文的 Title Case 短行）本身判据已严，不参与留白复核。
+                # generic：跨学科通用章节名（Experimental Section/Conclusions…），
+                # 这类词即使与正文同字号、版式不显眼也应成立；限 8 词以内，避免吃掉正文段首句。
+                generic = bool(GENERIC_HEAD_RE.match(text)) and len(text.split()) <= 8
                 weak = (len(text) < 120 and alpha > 0.35
                         and not _single_letter_only(text) and not _authorish(text)
                         and not BANNER_RE.match(text)
-                        and ((sizey or boldy or italic) and upperish and not AFFIL_RE.search(text)))
+                        and ((sizey or boldy or italic) and (upperish or generic)
+                             and not AFFIL_RE.search(text)))
                 plain = _plain_heading(text, grp, max_size, body_size, alpha, italic)
                 if plain and _inside_figure(bbox, figure_boxes):
                     plain = False
@@ -708,7 +752,9 @@ def parse_pdf(path: str) -> dict:
                     items.append((col, bbox[1], "para", text, bbox, max_size, None, False))
                     continue
                 if weak or plain:
-                    items.append((col, bbox[1], "heading", text, bbox, max_size, 0, weak))
+                    # plain 判据本身已严，不参与留白复核；别被同时命中的 weak 拖进去降级
+                    items.append((col, bbox[1], "heading", text, bbox, max_size, 0,
+                                  weak and not plain))
                     continue
                 kind = "formula" if (alpha < 0.25 and any(c.isdigit() for c in text)) else "para"
                 items.append((col, bbox[1], kind, text, bbox, max_size, None, False))

@@ -94,6 +94,16 @@ a { color: var(--accent); text-decoration: none; }
 .textLayer ::selection { background: rgba(59, 110, 245, .3); }
 .textLayer .endOfContent { display: block; position: absolute; inset: 100% 0 0; z-index: -1; cursor: default; user-select: none; }
 .page .pn { position: absolute; right: -2px; bottom: -20px; font-size: 11px; color: var(--muted); }
+.page .page-fail {
+  position: absolute; left: 8px; right: 8px; top: 42%; text-align: center; font-size: 12px;
+  color: #b4443c; background: rgba(255,246,244,.94); border: 1px solid #f0cfc9;
+  border-radius: 8px; padding: 8px 10px;
+}
+.page .page-note {
+  position: absolute; left: 8px; right: 8px; top: 42%; text-align: center; font-size: 12px;
+  color: var(--accent); background: rgba(244,247,255,.94); border: 1px solid #d4ddf5;
+  border-radius: 8px; padding: 8px 10px;
+}
 .zoombar {
   position: sticky; top: 0; z-index: 5; display: flex; gap: 6px; align-items: center;
   background: rgba(246,245,241,.88); backdrop-filter: blur(4px); padding: 8px 0;
