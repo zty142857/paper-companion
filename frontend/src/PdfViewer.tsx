@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import * as pdfjs from 'pdfjs-dist'
-import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import workerUrl from './pdf.worker?worker&url'
 
+// workerSrc 指向自建 worker 入口（见 pdf.worker.ts）：它会在启动 pdf.js worker 前补上
+// Map.prototype.getOrInsertComputed 等新内置方法，否则旧内核浏览器整篇 PDF 渲染失败。
+// 用 workerSrc 而不是 workerPort，保持 pdf.js 原有的"首次 getDocument 才建 worker"行为。
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
 
 export interface HitBlock {
