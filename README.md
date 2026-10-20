@@ -55,8 +55,9 @@
    | --- | --- |
    | Windows 64 位 | `paper-companion-win-x64.zip` |
    | macOS Apple 芯片（M1/M2/M3/M4） | `paper-companion-macos-arm64.zip` |
-   | macOS Intel 芯片 | `paper-companion-macos-x64.zip` |
    | Linux 64 位 | `paper-companion-linux-x64.tar.gz` |
+
+   > macOS Intel 暂不提供免安装包，可按[从源码运行](#5-从源码运行)自行启动。
 
 2. **解压**（不要直接在压缩包里双击运行）。
 3. 启动：

@@ -22,8 +22,6 @@ jobs:
             target: win-x64
           - os: ubuntu-22.04
             target: linux-x64
-          - os: macos-15-intel
-            target: macos-x64
           - os: macos-14
             target: macos-arm64
 
@@ -137,8 +135,9 @@ jobs:
           | --- | --- |
           | Windows 64 位 | `paper-companion-win-x64.zip` |
           | macOS Apple 芯片（M1/M2/M3/M4） | `paper-companion-macos-arm64.zip` |
-          | macOS Intel 芯片 | `paper-companion-macos-x64.zip` |
           | Linux 64 位 | `paper-companion-linux-x64.tar.gz` |
+
+          > macOS Intel 暂不提供免安装包，可按 README 从源码运行。
 
           ### 怎么启动
           1. 解压压缩包
