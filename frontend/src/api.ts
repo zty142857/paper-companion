@@ -18,6 +18,17 @@ export interface Paper {
   id: string; title: string; filename: string; pages: number
   structure: Structure; analysis: Analysis | null; status: string
   visited?: number; collected?: number; domain?: string | null; note?: string | null
+  folder_id?: string | null; folder_name?: string | null
+}
+export interface Folder {
+  id: string; name: string; created_at: number; paper_count?: number
+}
+export interface Highlight {
+  id: string; paper_id: string; page: number; color: string
+  text: string; rects: number[][]; created_at: number
+}
+export interface NewHighlight {
+  page: number; color: string; text: string; rects: number[][]
 }
 export interface LlmSettings {
   base_url: string; api_key: string; model: string; effort: string; has_key: boolean
@@ -42,6 +53,19 @@ export interface ProfileResponse {
 export interface SearchResult {
   source: string; title: string; abstract?: string; url?: string
   year?: string; doi?: string; authors?: string[]; error?: string
+}
+export interface Recommendation {
+  title: string; reason: string; doi?: string; url?: string
+  matched?: boolean; source?: string; year?: string
+  venue?: string; authors?: string[]; query?: string; direction?: string
+}
+export interface RecommendResponse {
+  items: Recommendation[]
+  scope: 'folder' | 'domain' | 'none'
+  scope_label: string
+  history_count: number
+  queries?: { query: string; why: string }[]
+  note?: string
 }
 export interface ChatStep { step: string; text: string }
 export interface QuizQuestion {
@@ -77,10 +101,22 @@ export const api = {
   list: (): Promise<Paper[]> => fetch('/api/papers').then(j),
   get: (id: string): Promise<Paper> => fetch(`/api/papers/${id}`).then(j),
   deletePaper: (id: string): Promise<any> => fetch(`/api/papers/${id}`, { method: 'DELETE' }).then(j),
-  upload: (file: File): Promise<{ id: string }> => {
+  upload: (file: File, folderId?: string): Promise<{ id: string }> => {
     const fd = new FormData(); fd.append('file', file)
-    return fetch('/api/papers', { method: 'POST', body: fd }).then(j)
+    const q = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''
+    return fetch(`/api/papers${q}`, { method: 'POST', body: fd }).then(j)
   },
+  folders: (): Promise<Folder[]> => fetch('/api/folders').then(j),
+  addFolder: (name: string): Promise<{ id: string; name: string }> =>
+    fetch('/api/folders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) }).then(j),
+  renameFolder: (fid: string, name: string): Promise<{ ok: boolean; name: string }> =>
+    fetch(`/api/folders/${fid}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) }).then(j),
+  deleteFolder: (fid: string): Promise<{ ok: boolean; papers_removed: number }> =>
+    fetch(`/api/folders/${fid}`, { method: 'DELETE' }).then(j),
+  movePaper: (pid: string, folder_id: string | null): Promise<{ ok: boolean }> =>
+    fetch(`/api/papers/${pid}/move`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ folder_id }) }).then(j),
+  copyPaper: (pid: string, folder_id: string | null): Promise<{ id: string }> =>
+    fetch(`/api/papers/${pid}/copy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ folder_id }) }).then(j),
   analyze: (id: string): Promise<Analysis> =>
     fetch(`/api/papers/${id}/analyze`, { method: 'POST' }).then(j),
   settings: (): Promise<LlmSettings> => fetch('/api/settings').then(j),
@@ -119,7 +155,7 @@ export const api = {
     fetch(`/api/papers/${pid}/collect`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ collected }) }).then(j),
   setNote: (pid: string, note: string): Promise<{ note: string }> =>
     fetch(`/api/papers/${pid}/note`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ note }) }).then(j),
-  recommend: (pid: string): Promise<{ items: { title: string; reason: string }[] }> => fetch(`/api/papers/${pid}/recommend`).then(j),
+  recommend: (pid: string): Promise<RecommendResponse> => fetch(`/api/papers/${pid}/recommend`).then(j),
   review: (paper_ids: string[] = []): Promise<{ review: string; count: number }> =>
     fetch('/api/review', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paper_ids }) }).then(j),
   makeQuiz: (pid: string): Promise<{ questions: QuizQuestion[]; error?: string }> =>
@@ -130,4 +166,11 @@ export const api = {
     fetch(`/api/papers/${pid}/quiz/answers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ answers }) }).then(j),
   gradeQuiz: (pid: string, questions: QuizQuestion[], answers: string[]): Promise<QuizGrade> =>
     fetch(`/api/papers/${pid}/quiz/grade`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ questions, answers }) }).then(j),
+  highlights: (pid: string): Promise<Highlight[]> => fetch(`/api/papers/${pid}/highlights`).then(j),
+  addHighlight: (pid: string, h: NewHighlight): Promise<Highlight> =>
+    fetch(`/api/papers/${pid}/highlights`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(h) }).then(j),
+  setHighlightColor: (hid: string, color: string): Promise<{ ok: boolean; color: string }> =>
+    fetch(`/api/highlights/${hid}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ color }) }).then(j),
+  deleteHighlight: (hid: string): Promise<{ ok: boolean }> =>
+    fetch(`/api/highlights/${hid}`, { method: 'DELETE' }).then(j),
 }

@@ -11,9 +11,12 @@
     "prebuild": "node scripts/copy-pdfjs-wasm.mjs",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "model:download": "bash scripts/download-formula-model.sh"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.7.5",
+    "katex": "^0.16.33",
     "pdfjs-dist": "^6.3.289",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import threading
 import mimetypes
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -31,10 +32,12 @@ def _prefetch_domain_guess(pid: str, structure: dict):
 
 
 @app.post("/api/papers")
-async def upload(file: UploadFile):
+async def upload(file: UploadFile, folder_id: str = ""):
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(400, "仅支持 PDF 文件")
-    pid = db.new_pending(file.filename)
+    if folder_id and not db.get_folder(folder_id):
+        raise HTTPException(404, "文件夹不存在")
+    pid = db.new_pending(file.filename, folder_id or None)
     path = os.path.join(db.PDF_DIR, f"{pid}.pdf")
     with open(path, "wb") as f:
         f.write(await file.read())
@@ -51,6 +54,101 @@ async def upload(file: UploadFile):
 @app.get("/api/papers")
 def papers():
     return db.list_papers()
+
+
+# ---------------- 文件夹 ----------------
+
+class FolderIn(BaseModel):
+    name: str
+
+
+def _folder_name(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        raise HTTPException(400, "文件夹名不能为空")
+    if len(n) > 40:
+        raise HTTPException(400, "文件夹名不能超过 40 个字符")
+    return n
+
+
+@app.get("/api/folders")
+def list_folders():
+    return db.list_folders()
+
+
+@app.post("/api/folders")
+def create_folder(body: FolderIn):
+    name = _folder_name(body.name)
+    if db.folder_name_exists(name):
+        raise HTTPException(409, "已存在同名文件夹")
+    fid = db.add_folder(name)
+    return {"id": fid, "name": name}
+
+
+@app.patch("/api/folders/{fid}")
+def rename_folder(fid: str, body: FolderIn):
+    if not db.get_folder(fid):
+        raise HTTPException(404, "文件夹不存在")
+    name = _folder_name(body.name)
+    if db.folder_name_exists(name, exclude_id=fid):
+        raise HTTPException(409, "已存在同名文件夹")
+    db.rename_folder(fid, name)
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/folders/{fid}")
+def remove_folder(fid: str):
+    """删除文件夹及其中的所有论文（用户确认后才会调用）。"""
+    folders = db.list_folders()
+    folder = next((f for f in folders if f["id"] == fid), None)
+    if not folder:
+        raise HTTPException(404, "文件夹不存在")
+    paths = db.delete_folder(fid, delete_papers=True)
+    for path in paths or []:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return {"ok": True, "papers_removed": folder.get("paper_count", 0)}
+
+
+class FolderTargetIn(BaseModel):
+    folder_id: str | None = None
+
+
+@app.post("/api/papers/{pid}/move")
+def move_paper_to_folder(pid: str, body: FolderTargetIn):
+    if not db.get_paper(pid):
+        raise HTTPException(404, "not found")
+    if body.folder_id and not db.get_folder(body.folder_id):
+        raise HTTPException(404, "文件夹不存在")
+    db.move_paper(pid, body.folder_id)
+    return {"ok": True, "folder_id": body.folder_id}
+
+
+@app.post("/api/papers/{pid}/copy")
+def copy_paper_to_folder(pid: str, body: FolderTargetIn):
+    """复制为独立副本：新论文记录 + 新 PDF，继承导读/卡片/笔记/标亮/画像。"""
+    src = db.get_paper(pid)
+    if not src:
+        raise HTTPException(404, "not found")
+    if body.folder_id and not db.get_folder(body.folder_id):
+        raise HTTPException(404, "文件夹不存在")
+    src_pdf = src.get("pdf_path") or ""
+    if not src_pdf or not os.path.exists(src_pdf):
+        raise HTTPException(422, "原论文 PDF 文件不存在，无法复制")
+    new_pid = db.new_paper_id()
+    new_pdf = os.path.join(db.PDF_DIR, f"{new_pid}.pdf")
+    shutil.copy2(src_pdf, new_pdf)
+    try:
+        db.copy_paper(pid, body.folder_id, new_pid, new_pdf)
+    except Exception:
+        try:
+            os.remove(new_pdf)
+        except OSError:
+            pass
+        raise
+    return {"id": new_pid}
 
 
 @app.get("/api/papers/{pid}")
@@ -147,6 +245,70 @@ def patch_card(cid: str, body: CardPatch):
 @app.delete("/api/cards/{cid}")
 def del_card(cid: str):
     db.delete_card(cid)
+    return {"ok": True}
+
+
+# ---------------- 原文标亮 ----------------
+
+HL_COLORS = {"yellow", "green", "blue", "pink"}
+
+
+class HighlightIn(BaseModel):
+    page: int
+    color: str = "yellow"
+    text: str = ""
+    rects: list[list[float]] = []
+
+
+class HighlightPatch(BaseModel):
+    color: str
+
+
+def _clean_rects(rects: list[list[float]]) -> list[list[float]]:
+    out = []
+    for r in rects or []:
+        if len(r) != 4:
+            continue
+        x0, y0, x1, y1 = (min(1.0, max(0.0, float(v))) for v in r)
+        if x1 - x0 < 0.001 or y1 - y0 < 0.001:
+            continue
+        out.append([round(x0, 5), round(y0, 5), round(x1, 5), round(y1, 5)])
+    return out
+
+
+@app.get("/api/papers/{pid}/highlights")
+def highlights(pid: str):
+    if not db.get_paper(pid):
+        raise HTTPException(404, "not found")
+    return db.list_highlights(pid)
+
+
+@app.post("/api/papers/{pid}/highlights")
+def add_highlight(pid: str, body: HighlightIn):
+    if not db.get_paper(pid):
+        raise HTTPException(404, "not found")
+    rects = _clean_rects(body.rects)
+    if not rects:
+        raise HTTPException(400, "标亮区域为空")
+    color = body.color if body.color in HL_COLORS else "yellow"
+    hid = db.add_highlight(pid, body.page, color, (body.text or "")[:2000], rects)
+    return {"id": hid, "page": body.page, "color": color, "text": body.text,
+            "rects": rects}
+
+
+@app.patch("/api/highlights/{hid}")
+def patch_highlight(hid: str, body: HighlightPatch):
+    if body.color not in HL_COLORS:
+        raise HTTPException(400, "不支持的标亮颜色")
+    if not db.set_highlight_color(hid, body.color):
+        raise HTTPException(404, "标亮不存在")
+    return {"ok": True, "color": body.color}
+
+
+@app.delete("/api/highlights/{hid}")
+def del_highlight(hid: str):
+    if not db.delete_highlight(hid):
+        raise HTTPException(404, "标亮不存在")
     return {"ok": True}
 
 
@@ -342,20 +504,82 @@ def recommend(pid: str):
         raise HTTPException(404, "not found")
     m = db.get_meta(pid) or {}
     has_profile = bool(m.get("domain")) and bool(m.get("plan"))
+    folder_id = p.get("folder_id")
+    rows = [r for r in db.list_papers() if r["id"] != pid]
+
+    # 推荐历史只看当前文件夹；文件夹内没有其他论文时退到同领域；再没有就少给。
+    scope = "none"
+    hist_rows: list[dict] = []
+    if folder_id:
+        hist_rows = [r for r in rows if r.get("folder_id") == folder_id]
+        if hist_rows:
+            scope = "folder"
+    domain = (m.get("domain") or "").strip()
+    if not hist_rows and domain:
+        hist_rows = [r for r in rows if (r.get("domain") or "").strip() == domain]
+        if hist_rows:
+            scope = "domain"
+
+    if scope == "folder":
+        fname = next((f["name"] for f in db.list_folders() if f["id"] == folder_id), "")
+        scope_label = f"文件夹「{fname or '当前文件夹'}」的阅读历史"
+    elif scope == "domain":
+        scope_label = f"同领域「{domain}」的阅读历史"
+    else:
+        scope_label = "暂无同文件夹 / 同领域阅读历史（仅依据本篇）"
+
     history = []
-    for row in db.list_papers():
-        if row["id"] == pid:
-            continue
+    for row in hist_rows[:20]:
         mm = db.get_meta(row["id"]) or {}
         asked = [c["data"].get("messages", [{}])[0].get("content", "")
                  for c in db.list_cards(row["id"]) if c["type"] == "chat"]
         history.append({"title": row["title"] or row["filename"],
                         "domain": mm.get("domain"), "asked": [a for a in asked if a]})
-    return profile.recommend(p["structure"],
-                             m.get("domain") or ("未分类" if not has_profile else ""),
-                             m.get("familiarity") or "",
-                             m.get("known_terms") or [], history,
-                             m.get("plan") if has_profile else None)
+
+    queries = profile.recommend_queries(
+        p["structure"],
+        m.get("domain") or ("未分类" if not has_profile else ""),
+        m.get("familiarity") or "",
+        m.get("known_terms") or [], history,
+        m.get("plan") if has_profile else None,
+        scope_label=scope_label)
+    context = p.get("title") or p.get("filename") or ""
+    known_titles = [r.get("title") or r.get("filename") or ""
+                    for r in db.list_papers() if r["id"] != pid]
+    picks = search.pick_recommendations(queries, context=context,
+                                        exclude_titles=known_titles, limit=3)
+    if not picks:
+        return {"items": [], "scope": scope, "scope_label": scope_label,
+                "history_count": len(history), "queries": queries,
+                "note": "没有检索到符合当前论文领域的真实文献，请重试或调整阅读计划。"}
+
+    try:
+        reasons = profile.recommend_reasons(
+            picks, p["structure"],
+            m.get("domain") or ("未分类" if not has_profile else ""),
+            m.get("familiarity") or "", history,
+            m.get("plan") if has_profile else None)
+    except Exception:
+        reasons = [q.get("why", "") for q in picks]
+
+    items = []
+    for pick, reason in zip(picks, reasons):
+        doi = pick.get("doi") or ""
+        items.append({
+            "title": pick.get("title") or "",
+            "reason": reason or pick.get("why") or "同领域真实文献，可按摘要了解其方法与结论。",
+            "doi": doi,
+            "url": f"https://doi.org/{doi}" if doi else (pick.get("url") or ""),
+            "source": pick.get("source") or "",
+            "year": pick.get("year") or "",
+            "venue": pick.get("venue") or "",
+            "authors": (pick.get("authors") or [])[:4],
+            "query": pick.get("query") or "",
+            "direction": pick.get("why") or "",
+            "matched": True,
+        })
+    return {"items": items, "scope": scope, "scope_label": scope_label,
+            "history_count": len(history), "queries": queries}
 
 
 class ReviewIn(BaseModel):

@@ -133,27 +133,93 @@ def make_plan(structure: dict, domain: str, familiarity: str, known_terms: list[
     }
 
 
-def recommend(structure: dict, domain: str, familiarity: str, known_terms: list[str],
-              history: list[dict], plan: dict | None = None) -> dict:
-    """基于档案与阅读历史，推荐 3 篇相关文献（LLM 给出方向，再用检索补足链接）。"""
-    brief = _paper_brief(structure)
+def _profile_lines(domain: str, familiarity: str, history: list[dict],
+                   plan: dict | None, scope_label: str = "") -> tuple[str, str, str]:
     hist = json.dumps([{"title": h.get("title"), "domain": h.get("domain"),
                         "asked": h.get("asked", [])[:6]} for h in history][:8], ensure_ascii=False)
     focus = [x for x in ((plan or {}).get("focus") or []) if isinstance(x, str)]
     skip = [x for x in ((plan or {}).get("skip") or []) if isinstance(x, str)]
     plan_line = ""
     if focus:
-        plan_line += f"\n读者的阅读计划重点关注：{'；'.join(focus)}。推荐应优先贴合这些关注点。"
+        plan_line += f"\n读者的阅读计划重点关注：{'；'.join(focus)}。"
     if skip:
-        plan_line += f"\n读者计划略读：{'；'.join(skip)}。避免推荐这些已熟悉方向的入门材料。"
-    # 无画像时不给特殊提示
-    profile_line = f"读者领域「{domain}」，熟悉度「{familiarity}」。" if domain or familiarity else ""
-    prompt = f"""{profile_line}当前论文：{brief['title']}。{plan_line}
+        plan_line += f"\n读者计划略读：{'；'.join(skip)}。"
+    profile_line = (f"读者领域「{domain}」，熟悉度「{familiarity}」。" if domain or familiarity else "")
+    scope_line = (f"\n本次推荐范围：{scope_label}。只依据该范围内的阅读历史。"
+                  if scope_label else "")
+    return hist, plan_line, profile_line + scope_line
+
+
+def recommend_queries(structure: dict, domain: str, familiarity: str, known_terms: list[str],
+                      history: list[dict], plan: dict | None = None,
+                      scope_label: str = "") -> list[dict]:
+    """让模型只产出检索方向/关键词，不产出具体论文标题。
+
+    具体论文由后端到 OpenAlex/Crossref/S2/arXiv 检索，DOI 来自数据库，避免编造书目信息。
+    """
+    brief = _paper_brief(structure)
+    hist, plan_line, profile_line = _profile_lines(domain, familiarity, history, plan, scope_label)
+    prompt = f"""{profile_line}当前论文：{json.dumps(brief, ensure_ascii=False)[:2500]}{plan_line}
 阅读历史（含其提问过的点）：{hist}
-请推荐 3 篇值得继续阅读的方向/文献，理由要引用读者的历史（如"你读过X、问过Y"）。输出 JSON：
-{{"items": [{{"title": "推荐文献或方向的标题", "reason": "结合读者历史的推荐理由"}}]}}"""
-    data = llm.chat_json(prompt, "你是文献推荐助手，理由必须个性化、引用读者历史。")
-    return {"items": [i for i in data.get("items", []) if i.get("title")][:3]}
+
+请给出 3 个互补的「检索方向」，供后端到 OpenAlex / Crossref / Semantic Scholar / arXiv 检索真实论文。
+输出 JSON：
+{{"queries": [{{"query": "英文检索关键词，3-8 个词，包含领域限定词", "why": "这个方向为什么适合该读者（结合其历史/计划，1-2 句中文）"}}]}}
+要求：
+- query 只写检索关键词，**不要**写论文标题、作者、年份、DOI；不要试图回忆具体论文。
+- 3 个方向分别覆盖不同侧面（例如方法、评估指标、相近构型/应用），不要重复。
+- 关键词用英文；避免过于宽泛的词（如只有 "machine learning"），要带上领域词。
+- 不要推荐阅读历史里已经读过的论文。"""
+    data = llm.chat_json(prompt, "你是论文检索规划助手，只输出检索方向，不输出具体论文条目。")
+    out = []
+    for q in data.get("queries", []):
+        if not isinstance(q, dict):
+            continue
+        query = str(q.get("query") or "").strip()
+        why = str(q.get("why") or "").strip()
+        if query:
+            out.append({"query": query, "why": why})
+    return out[:3]
+
+
+def recommend_reasons(papers: list[dict], structure: dict, domain: str, familiarity: str,
+                      history: list[dict], plan: dict | None = None) -> list[str]:
+    """拿到真实论文后，再让模型基于真实标题/摘要写个性化推荐理由。"""
+    brief = _paper_brief(structure)
+    hist, plan_line, profile_line = _profile_lines(domain, familiarity, history, plan)
+    packs = []
+    for i, p in enumerate(papers):
+        authors = "、".join((p.get("authors") or [])[:4])
+        packs.append(
+            f"### 论文 {i}\n"
+            f"标题：{p.get('title', '')}\n"
+            f"来源/年份：{p.get('venue') or p.get('source') or ''} {p.get('year', '')}\n"
+            f"作者：{authors or '（未提供）'}\n"
+            f"摘要：{(p.get('abstract') or '（无摘要，仅依据标题）')[:700]}\n"
+            f"检索方向：{p.get('query', '')}"
+        )
+    prompt = f"""{profile_line}当前论文：{json.dumps(brief, ensure_ascii=False)[:2000]}{plan_line}
+阅读历史（含其提问过的点）：{hist}
+
+下面是后端检索到的**真实论文**，请为每一篇写 2-3 句中文推荐理由：说明为什么值得读、建议先关注什么、与读者历史/计划的联系。
+要求：
+- 只能依据给出的标题与摘要，不得编造论文中没有的内容、作者或 DOI。
+- 不要提及其他论文，也不要输出新的文献条目。
+- 每条理由 2-3 句，直接可读，不要加“这篇论文”以外的标题。
+输出 JSON：{{"reasons": [{{"index": 0, "reason": "..."}}]}}
+
+{chr(10).join(packs)}"""
+    data = llm.chat_json(prompt, "你是论文阅读推荐助手，只能基于给定的真实论文信息写理由，严禁编造。")
+    by_idx: dict[int, str] = {}
+    for r in data.get("reasons", []):
+        try:
+            idx = int(r.get("index"))
+        except (TypeError, ValueError):
+            continue
+        text = str(r.get("reason") or "").strip()
+        if text:
+            by_idx[idx] = text
+    return [by_idx.get(i) or (p.get("why") or "") for i, p in enumerate(papers)]
 
 
 def review(papers: list[dict]) -> dict:

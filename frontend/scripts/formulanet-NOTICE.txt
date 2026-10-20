@@ -1,0 +1,15 @@
+FormulaNet / Texo
+=================
+
+This application bundles the FormulaNet formula-recognition model for local,
+in-browser inference.
+
+- Project: Texo — https://github.com/alephpi/Texo
+- Model:   FormulaNet — https://huggingface.co/alephpi/FormulaNet
+- License: GNU Affero General Public License v3.0 (AGPL-3.0)
+           https://www.gnu.org/licenses/agpl-3.0.html
+
+The model files are downloaded from the Hugging Face model repository during
+release packaging and are not part of the Git repository. No paper content or
+user data is sent to the model or to Hugging Face; inference runs locally in a
+Web Worker.

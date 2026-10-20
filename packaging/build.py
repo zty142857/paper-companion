@@ -82,6 +82,11 @@ Linux   : 双击 start.sh，或在终端执行  ./start.sh
 如果仍被拦截，在终端执行一次：
     xattr -dr com.apple.quarantine .
 
+【公式识别】
+本发行包内置 FormulaNet / Texo 公式 OCR 模型，识别在浏览器本地完成，
+不会上传论文内容。模型来源与 AGPL-3.0 许可见程序目录中的
+frontend_dist/models/formulanet/NOTICE.txt。
+
 【常见问题】
 - 端口被占用：程序会自动从 8765 起往后找空闲端口，以窗口里打印的地址为准。
 - 提示未配置 API Key：到「模型设置」里填。

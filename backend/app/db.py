@@ -50,7 +50,8 @@ def init():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS paper(
           id TEXT PRIMARY KEY, title TEXT, filename TEXT, pdf_path TEXT,
-          pages INTEGER, structure TEXT, analysis TEXT, status TEXT, created_at REAL);
+          pages INTEGER, structure TEXT, analysis TEXT, status TEXT, created_at REAL,
+          folder_id TEXT);
         CREATE TABLE IF NOT EXISTS setting(k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS card(
           id TEXT PRIMARY KEY, paper_id TEXT, type TEXT, block_id TEXT,
@@ -61,8 +62,16 @@ def init():
           paper_id TEXT PRIMARY KEY, domain TEXT, familiarity TEXT,
           known_terms TEXT, plan TEXT, note TEXT, quiz_score TEXT, visited INTEGER, collected INTEGER, updated_at REAL,
           domain_guess TEXT, dismissed_terms TEXT, quiz TEXT);
+        CREATE TABLE IF NOT EXISTS folder(
+          id TEXT PRIMARY KEY, name TEXT, created_at REAL);
+        CREATE TABLE IF NOT EXISTS highlight(
+          id TEXT PRIMARY KEY, paper_id TEXT, page INTEGER, color TEXT,
+          text TEXT, rects TEXT, created_at REAL);
         """)
         # 轻量迁移：旧库补列
+        pcols = {r[1] for r in c.execute("PRAGMA table_info(paper)")}
+        if "folder_id" not in pcols:
+            c.execute("ALTER TABLE paper ADD COLUMN folder_id TEXT")
         cols = {r[1] for r in c.execute("PRAGMA table_info(paper_meta)")}
         if "note" not in cols:
             c.execute("ALTER TABLE paper_meta ADD COLUMN note TEXT")
@@ -76,12 +85,16 @@ def init():
             c.execute("ALTER TABLE paper_meta ADD COLUMN quiz TEXT")
 
 
-def new_pending(filename) -> str:
-    pid = uuid.uuid4().hex[:12]
+def new_paper_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def new_pending(filename, folder_id=None) -> str:
+    pid = new_paper_id()
     with conn() as c:
-        c.execute("INSERT INTO paper(id,title,filename,pdf_path,pages,structure,analysis,status,created_at)"
-                  " VALUES(?,?,?,?,?,?,?,?,?)",
-                  (pid, "", filename, "", 0, "{}", None, "parsing", time.time()))
+        c.execute("INSERT INTO paper(id,title,filename,pdf_path,pages,structure,analysis,status,created_at,folder_id)"
+                  " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (pid, "", filename, "", 0, "{}", None, "parsing", time.time(), folder_id or None))
     return pid
 
 
@@ -111,10 +124,11 @@ def get_paper(pid) -> dict | None:
 def list_papers() -> list[dict]:
     with conn() as c:
         rows = c.execute(
-            "SELECT p.id,p.title,p.filename,p.pages,p.status,p.created_at,"
+            "SELECT p.id,p.title,p.filename,p.pages,p.status,p.created_at,p.folder_id,"
             " COALESCE(m.visited,0) AS visited, COALESCE(m.collected,0) AS collected,"
-            " m.domain AS domain, m.note AS note"
+            " m.domain AS domain, m.note AS note, f.name AS folder_name"
             " FROM paper p LEFT JOIN paper_meta m ON m.paper_id=p.id"
+            " LEFT JOIN folder f ON f.id=p.folder_id"
             " ORDER BY p.created_at DESC").fetchall()
     return [dict(r) for r in rows]
 
@@ -174,9 +188,164 @@ def delete_paper(pid) -> str | None:
         return None
     with conn() as c:
         c.execute("DELETE FROM card WHERE paper_id=?", (pid,))
+        c.execute("DELETE FROM highlight WHERE paper_id=?", (pid,))
         c.execute("DELETE FROM paper_meta WHERE paper_id=?", (pid,))
         c.execute("DELETE FROM paper WHERE id=?", (pid,))
     return p.get("pdf_path") or None
+
+
+# ---------- 文件夹：单层，论文只属于一个文件夹；复制=独立副本 ----------
+
+def list_folders() -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT f.id,f.name,f.created_at, COUNT(p.id) AS paper_count"
+            " FROM folder f LEFT JOIN paper p ON p.folder_id=f.id"
+            " GROUP BY f.id ORDER BY f.created_at").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_folder(fid) -> dict | None:
+    with conn() as c:
+        r = c.execute("SELECT * FROM folder WHERE id=?", (fid,)).fetchone()
+    return dict(r) if r else None
+
+
+def folder_name_exists(name, exclude_id=None) -> bool:
+    with conn() as c:
+        if exclude_id:
+            r = c.execute("SELECT id FROM folder WHERE name=? AND id<>?", (name, exclude_id)).fetchone()
+        else:
+            r = c.execute("SELECT id FROM folder WHERE name=?", (name,)).fetchone()
+    return r is not None
+
+
+def add_folder(name: str) -> str:
+    fid = uuid.uuid4().hex[:12]
+    with conn() as c:
+        c.execute("INSERT INTO folder(id,name,created_at) VALUES(?,?,?)", (fid, name, time.time()))
+    return fid
+
+
+def rename_folder(fid, name: str) -> bool:
+    with conn() as c:
+        cur = c.execute("UPDATE folder SET name=? WHERE id=?", (name, fid))
+    return cur.rowcount > 0
+
+
+def delete_folder(fid, delete_papers: bool = True) -> list[str] | None:
+    """删除文件夹。delete_papers=True 时连同论文/卡片/笔记/标亮一起删除，返回待删 PDF 路径。"""
+    if not get_folder(fid):
+        return None
+    paths: list[str] = []
+    with conn() as c:
+        rows = c.execute("SELECT id,pdf_path FROM paper WHERE folder_id=?", (fid,)).fetchall()
+        if delete_papers:
+            for r in rows:
+                if r["pdf_path"]:
+                    paths.append(r["pdf_path"])
+                c.execute("DELETE FROM card WHERE paper_id=?", (r["id"],))
+                c.execute("DELETE FROM highlight WHERE paper_id=?", (r["id"],))
+                c.execute("DELETE FROM paper_meta WHERE paper_id=?", (r["id"],))
+                c.execute("DELETE FROM paper WHERE id=?", (r["id"],))
+        else:
+            c.execute("UPDATE paper SET folder_id=NULL WHERE folder_id=?", (fid,))
+        c.execute("DELETE FROM folder WHERE id=?", (fid,))
+    return paths
+
+
+def move_paper(pid, folder_id) -> bool:
+    with conn() as c:
+        cur = c.execute("UPDATE paper SET folder_id=? WHERE id=?", (folder_id or None, pid))
+    return cur.rowcount > 0
+
+
+def copy_paper(pid, folder_id, new_pid: str, new_pdf_path: str) -> str | None:
+    """把论文复制成一份完全独立的副本（结构/导读/卡片/笔记/标亮/画像/收藏）。"""
+    src = get_paper(pid)
+    if not src:
+        return None
+    title = (src.get("title") or src.get("filename") or "").strip()
+    if not title.endswith("（副本）"):
+        title = f"{title}（副本）"
+    now = time.time()
+    with conn() as c:
+        c.execute(
+            "INSERT INTO paper(id,title,filename,pdf_path,pages,structure,analysis,status,created_at,folder_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (new_pid, title, src.get("filename") or "", new_pdf_path, src.get("pages") or 0,
+             json.dumps(src.get("structure") or {}, ensure_ascii=False),
+             json.dumps(src["analysis"], ensure_ascii=False) if src.get("analysis") else None,
+             src.get("status") or "parsed", now, folder_id or None))
+        for r in c.execute("SELECT * FROM card WHERE paper_id=?", (pid,)).fetchall():
+            c.execute("INSERT INTO card(id,paper_id,type,block_id,top,data,created_at)"
+                      " VALUES(?,?,?,?,?,?,?)",
+                      (uuid.uuid4().hex[:12], new_pid, r["type"], r["block_id"], r["top"],
+                       r["data"], r["created_at"]))
+        m = c.execute("SELECT * FROM paper_meta WHERE paper_id=?", (pid,)).fetchone()
+        if m:
+            cols = [k for k in m.keys() if k not in ("paper_id", "updated_at")]
+            vals = [m[k] for k in cols]
+            c.execute(f"INSERT INTO paper_meta(paper_id,{','.join(cols)},updated_at)"
+                      f" VALUES(?,{','.join('?' * len(cols))},?)",
+                      (new_pid, *vals, now))
+        for r in c.execute("SELECT * FROM highlight WHERE paper_id=?", (pid,)).fetchall():
+            c.execute("INSERT INTO highlight(id,paper_id,page,color,text,rects,created_at)"
+                      " VALUES(?,?,?,?,?,?,?)",
+                      (uuid.uuid4().hex[:12], new_pid, r["page"], r["color"], r["text"],
+                       r["rects"], r["created_at"]))
+    return new_pid
+
+
+# ---------- 原文标亮 ----------
+
+def list_highlights(pid) -> list[dict]:
+    with conn() as c:
+        rows = c.execute("SELECT * FROM highlight WHERE paper_id=? ORDER BY page,created_at",
+                         (pid,)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["rects"] = json.loads(d["rects"]) if d.get("rects") else []
+        except (TypeError, ValueError):
+            d["rects"] = []
+        out.append(d)
+    return out
+
+
+def add_highlight(pid, page: int, color: str, text: str, rects: list) -> str:
+    hid = uuid.uuid4().hex[:12]
+    with conn() as c:
+        c.execute("INSERT INTO highlight(id,paper_id,page,color,text,rects,created_at)"
+                  " VALUES(?,?,?,?,?,?,?)",
+                  (hid, pid, page, color, text, json.dumps(rects, ensure_ascii=False), time.time()))
+    return hid
+
+
+def get_highlight(hid) -> dict | None:
+    with conn() as c:
+        r = c.execute("SELECT * FROM highlight WHERE id=?", (hid,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    try:
+        d["rects"] = json.loads(d["rects"]) if d.get("rects") else []
+    except (TypeError, ValueError):
+        d["rects"] = []
+    return d
+
+
+def set_highlight_color(hid, color: str) -> bool:
+    with conn() as c:
+        cur = c.execute("UPDATE highlight SET color=? WHERE id=?", (color, hid))
+    return cur.rowcount > 0
+
+
+def delete_highlight(hid) -> bool:
+    with conn() as c:
+        cur = c.execute("DELETE FROM highlight WHERE id=?", (hid,))
+    return cur.rowcount > 0
 
 
 # ---------- profile（领域档案）与 paper_meta（每篇论文的摸底/计划/收藏） ----------
@@ -260,9 +429,11 @@ def clear_all_data(keep_llm_settings: bool = True) -> int:
     n = len(list_papers())
     with conn() as c:
         c.execute("DELETE FROM card")
+        c.execute("DELETE FROM highlight")
         c.execute("DELETE FROM paper_meta")
         c.execute("DELETE FROM profile")
         c.execute("DELETE FROM paper")
+        c.execute("DELETE FROM folder")
         c.execute("DELETE FROM setting WHERE k='llm_api_key'")
         if not keep_llm_settings:
             c.execute("DELETE FROM setting")

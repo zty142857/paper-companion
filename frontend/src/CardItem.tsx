@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Card } from './api'
 import Markdown from './Markdown'
 
@@ -14,6 +14,8 @@ interface Props {
   onJump: (page: number) => void
   onResize: (w: number) => void          // 拖拽右边缘调整宽度（实时）
   onResizeEnd: (w: number) => void       // 松手：落库
+  onPatch: (data: Record<string, any>) => void   // 笔记等就地编辑后落库
+  maxWidth?: number                      // 左轨卡片限宽，避免盖住论文
 }
 
 const CARD_DEFAULT_W = 288
@@ -21,26 +23,29 @@ const CARD_MIN_W = 220
 const CARD_MAX_W = 640
 const CARD_W_STEP = 1.08      // 双击缩放宽/高
 
-const clampW = (w: number) => Math.round(Math.min(CARD_MAX_W, Math.max(CARD_MIN_W, w)))
+const TYPE_ICON: Record<string, string> = { translation: '🈶', chat: '💬', term: '📚', note: '📝' }
 
-const TYPE_ICON: Record<string, string> = { translation: '🈶', chat: '💬', term: '📚' }
-
-export default function CardItem({ card, top, active, onActivate, onTop, onDrop, onDelete, onAsk, onJump, onResize, onResizeEnd }: Props) {
-  const [open, setOpen] = useState(false)
+export default function CardItem({ card, top, active, onActivate, onTop, onDrop, onDelete, onAsk, onJump, onResize, onResizeEnd, onPatch, maxWidth }: Props) {
+  const [open, setOpen] = useState(card.type === 'note' && !card.data?.text)
   const [q, setQ] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
-  const width = card.data.width ?? CARD_DEFAULT_W
+  const [noteText, setNoteText] = useState<string>(card.data?.text ?? '')
+  const maxW = Math.min(CARD_MAX_W, Math.max(CARD_MIN_W, maxWidth ?? CARD_MAX_W))
+  const clampW = (w: number) => Math.round(Math.min(maxW, Math.max(CARD_MIN_W, w)))
+  const width = clampW(card.data.width ?? Math.min(CARD_DEFAULT_W, maxW))
   const drag = useRef<{ startY: number; startTop: number; moved: boolean } | null>(null)
   const dragged = useRef(false)
   const resize = useRef<{ startX: number; startW: number } | null>(null)
   const d = card.data
+  useEffect(() => { setNoteText(d.text ?? '') }, [card.id, d.text])
   const isGlobalChat = card.type === 'chat' && !!d.global
   const title = card.type === 'translation' ? (d.pending ? '译文 · 翻译中…' : d.error ? '译文 · 失败' : `译文 · 第${d.page ?? '?'}页`)
-    : card.type === 'term' ? `术语 · ${d.term}` : isGlobalChat ? '子对话 · 🌐全文' : '子对话'
+    : card.type === 'term' ? `术语 · ${d.term}` : card.type === 'note' ? '笔记' : isGlobalChat ? '子对话 · 🌐全文' : '子对话'
   // 收起时也显示一段预览，避免用户以为卡片是空的
   const preview = card.type === 'translation'
     ? (d.error ? `翻译失败：${d.error}` : d.pending ? '翻译中…' : (d.translation || d.orig || ''))
+    : card.type === 'note' ? (d.text || '点开写笔记…')
     : ((d.messages ?? []).slice(-1)[0]?.content || '点开输入你的问题')
 
   const down = (e: React.PointerEvent) => {
@@ -93,6 +98,10 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
     try { await onAsk(t) } finally { setBusy(false) }
   }
 
+  const saveNote = () => {
+    if (noteText !== (d.text ?? '')) onPatch({ ...d, text: noteText })
+  }
+
   return (
     <div className={`card ${card.type}${active ? ' active' : ''}`} data-id={card.id} style={{ top, width }}
       onPointerDownCapture={onActivate}>
@@ -112,6 +121,19 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
       </div>
       {!open && preview && <div className="preview">{preview}</div>}
       {open && <div className="cb">
+        {card.type === 'note' && (
+          <>
+            <textarea className="note-editor" rows={5} autoFocus={!d.text}
+              placeholder="写下你的笔记…（失焦自动保存；支持 $公式$）"
+              value={noteText}
+              onChange={(e) => setNoteText(e.target.value)}
+              onBlur={saveNote}
+              onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); (e.target as HTMLTextAreaElement).blur() } }} />
+            {/\$|\\\(|\\\[/.test(noteText) && (
+              <div className="note-preview"><Markdown text={noteText} /></div>
+            )}
+          </>
+        )}
         {card.type === 'translation' && <>
           <div className="orig">{d.orig}</div>
           {d.error ? <div className="err">翻译失败：{d.error}</div>
@@ -127,7 +149,7 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
           </>}
           {(d.messages ?? []).map((m: any, i: number) => (
             <div key={i} className={m.role === 'user' ? 'msg u' : 'msg a'}>
-              {m.role === 'user' ? m.content : <>
+              {m.role === 'user' ? <Markdown text={m.content} /> : <>
                 <Markdown text={m.content} />
                 {m.pages?.length > 0 && <div className="src">
                   {m.pages.map((p: number) => <button key={p} onClick={() => onJump(p)}>📄 第{p}页</button>)}

@@ -18,4 +18,8 @@ release/
 
 # 项目内部文档与比赛方案：不进仓库，只留本地
 PROJECT.md
-西安交通大学《电信T.A杯》“AI+教育”创新应用技能大赛比赛方案.docx
+*.docx
+*:WPSSyncID
+
+# 公式 OCR 模型（本地缓存，约 77MB，不入库）
+frontend/public/models/
