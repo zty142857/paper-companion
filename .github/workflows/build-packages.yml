@@ -58,7 +58,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python packaging/build.py --target ${{ matrix.target }} 2>&1 | tee build.log
+          extra=""
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+            # 分支/PR 构建不下载 77MB 公式模型，允许产出不带公式识别的包
+            extra="--allow-missing-model"
+          fi
+          python packaging/build.py --target ${{ matrix.target }} $extra 2>&1 | tee build.log
 
       - name: Publish build log on failure
         if: failure()
@@ -124,11 +129,11 @@ jobs:
           解压即用，**不需要安装 Python 或 Node**。
 
           ### 本版亮点
-          - 新增文件夹 / 独立副本 / 文件夹内推荐
-          - 新增全文检索、四色标亮与笔记卡
-          - 新增公式识别：拖选公式或「∑ 框选公式」，本地 OCR 输出 LaTeX，支持 KaTeX 渲染
-          - 推荐改为检索优先，DOI 来自 OpenAlex / Crossref / Semantic Scholar / arXiv
-          - 公式 OCR 模型随发行包提供，首次识别无需联网下载模型
+          - 公式框选改用版面模型：直接吸附到整条公式，并自动去掉右侧编号
+          - 老论文（旧版解析结果）继续沿用 PUA 片段启发式兜底，不用重新解析
+          - 发行包体积精简约 45MB：裁掉运行时不用的版面模型、编译头和工具链
+          - 修复数据目录搬家后 PDF 打不开的问题
+          - 公式识别仍是本地 OCR，模型随包提供，首次识别无需联网下载
 
           ### 下载哪个？
           | 你的系统 | 下载文件 |
