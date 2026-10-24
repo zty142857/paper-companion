@@ -204,6 +204,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   const [err, setErr] = useState('')
   const renderTimer = useRef<number | null>(null)
   const pageEls = useRef(new Map<number, { el: HTMLDivElement; scale: number }>())
+  const docRef = useRef<pdfjs.PDFDocumentProxy | null>(null)
   const textLayers = useRef<pdfjs.TextLayer[]>([])
   const baseW = useRef(0)          // 页面在 100% 时的宽度（PDF 点）
   const fittedUrl = useRef('')     // 已完成自动适配的文档，避免每次缩放都重算
@@ -251,6 +252,26 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
           layer.appendChild(div)
         }
       }
+    }
+  }
+
+  /** 调试用：`?debug=formula` 时把吸附区域描出来（红色框），方便人工核对命中率 */
+  const drawFormulaDebug = () => {
+    const on = location.href.includes('debug=formula')
+    for (const [, pe] of pageEls.current) {
+      pe.el.querySelectorAll('.formula-debug').forEach((n) => n.remove())
+    }
+    if (!on) return
+    for (const reg of formulaRegionsRef.current) {
+      const pe = pageEls.current.get(reg.page)
+      if (!pe) continue
+      const d = document.createElement('div')
+      d.className = 'formula-debug'
+      d.style.cssText = 'position:absolute;pointer-events:none;z-index:5;'
+        + 'border:1px solid rgba(239,68,68,.85);background:rgba(239,68,68,.07);'
+        + `left:${reg.x0 * pe.scale}px;top:${reg.y0 * pe.scale}px;`
+        + `width:${(reg.x1 - reg.x0) * pe.scale}px;height:${(reg.y1 - reg.y0) * pe.scale}px`
+      pe.el.appendChild(d)
     }
   }
 
@@ -326,7 +347,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     return merged.length > 0
   }
 
-  /** 从 PDF 画布截一块 PNG；坐标是 canvas 像素。 */
+  /** 从 PDF 画布截一块 PNG；坐标是 canvas 像素。屏幕画布分辨率不够时的兜底。 */
   const cropPagePixels = (page: number, x0: number, y0: number, x1: number, y1: number,
     padding = 8): Promise<Blob | null> => {
     const pe = pageEls.current.get(page)
@@ -353,16 +374,107 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     return new Promise((resolve) => out.toBlob((b) => resolve(b), 'image/png'))
   }
 
-  /** 把当前选区所在的 PDF 画布区域截成 PNG，供公式 OCR 使用。 */
-  const selectionImage = (sel: SelectedText, padding = 8): Promise<Blob | null> => {
+  /** 公式 OCR 想看的长边像素。worker 的输入是 384，先渲染到 640 再缩下去，
+      比直接用屏幕画布（常见 200~300px，字高不到 10px）清楚得多。 */
+  const OCR_LONG_SIDE = 640
+
+  /** 只把选区那一块重新光栅化：按 pt 坐标算缩放，与当前窗口大小/缩放级别无关。
+      padding 单位是 pt。渲染失败由调用方退回屏幕画布。 */
+  const cropRegionHiRes = async (p: pdfjs.PDFPageProxy,
+    box: { x0: number; y0: number; x1: number; y1: number },
+    padPt: number, target = OCR_LONG_SIDE): Promise<Blob | null> => {
+    const w = Math.max(1, box.x1 - box.x0)
+    const h = Math.max(1, box.y1 - box.y0)
+    // 长边至少 640，且不低于 4 倍（≈288 DPI）：版面框常常是"整栏宽"，按框的长边算
+    // 只能拿到 1.5 倍，公式本身在框里只占一半，送进 384 的模型等于没放大。
+    // 所以这里按"打印级 DPI"兜底，画布大小只跟裁出来的这块有关，不随整页膨胀。
+    let scale = Math.max(4, target / Math.max(w, h))
+    let pad = Math.max(2, Math.round(padPt * scale))
+    let cw = Math.ceil(w * scale) + pad * 2
+    let ch = Math.ceil(h * scale) + pad * 2
+    // 只兜画布尺寸的硬上限（2600px，约 9MB），不是画质折中
+    const MAX_CANVAS = 2600
+    if (cw > MAX_CANVAS || ch > MAX_CANVAS) {
+      scale *= MAX_CANVAS / Math.max(cw, ch)
+      pad = Math.max(2, Math.round(padPt * scale))
+      cw = Math.ceil(w * scale) + pad * 2
+      ch = Math.ceil(h * scale) + pad * 2
+    }
+    if (cw < 4 || ch < 4) return null
+    const vp = p.getViewport({ scale })
+    const canvas = document.createElement('canvas')
+    canvas.width = cw
+    canvas.height = ch
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.fillStyle = '#fff'
+    ctx.fillRect(0, 0, cw, ch)
+    // transform 作用在视口变换之后（设备像素空间）：把画布原点挪到选区左上角，
+    // 这样只光栅化裁出来的这一块，画布不会随整页尺寸膨胀。
+    await p.render({
+      canvasContext: ctx,
+      viewport: vp,
+      transform: [1, 0, 0, 1, pad - box.x0 * scale, pad - box.y0 * scale],
+      background: '#ffffff',
+    } as any).promise
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), 'image/png'))
+    if (blob && location.href.includes('debug=formula')) {
+      // 调试：把真正送进 OCR 的图钉在右下角，核对裁剪有没有偏移
+      let panel = document.getElementById('crop-debug')
+      if (!panel) {
+        panel = document.createElement('div')
+        panel.id = 'crop-debug'
+        panel.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:9999;background:#fff;'
+          + 'border:2px solid #ef4444;padding:4px;max-width:42vw'
+        document.body.appendChild(panel)
+      }
+      panel.innerHTML = ''
+      const img = document.createElement('img')
+      img.src = URL.createObjectURL(blob)
+      img.style.cssText = 'display:block;max-width:40vw;max-height:38vh'
+      const info = document.createElement('div')
+      info.textContent = `crop ${canvas.width}x${canvas.height} @${scale.toFixed(2)}x`
+      info.style.cssText = 'font:11px monospace;color:#b91c1c'
+      panel.append(img, info)
+    }
+    return blob
+  }
+
+  const cropHiRes = async (page: number,
+    box: { x0: number; y0: number; x1: number; y1: number }, padPt: number) => {
+    const doc = docRef.current
+    if (!doc) return null
+    try {
+      return await cropRegionHiRes(await doc.getPage(page), box, padPt)
+    } catch {
+      return null
+    }
+  }
+
+  /** 把当前选区所在的区域截成 PNG（优先高分辨率重渲染），供公式 OCR 使用。 */
+  const selectionImage = async (sel: SelectedText, padding = 8): Promise<Blob | null> => {
     const pe = pageEls.current.get(sel.page)
     const canvas = pe?.el.querySelector('canvas')
     if (!canvas || !sel.rects?.length) return Promise.resolve(null)
     const xs = sel.rects.flatMap((r) => [r[0], r[2]])
     const ys = sel.rects.flatMap((r) => [r[1], r[3]])
+    const nx0 = Math.min(...xs), ny0 = Math.min(...ys)
+    const nx1 = Math.max(...xs), ny1 = Math.max(...ys)
+    const doc = docRef.current
+    if (doc) {
+      try {
+        const page = await doc.getPage(sel.page)
+        const vp1 = page.getViewport({ scale: 1 })
+        const blob = await cropRegionHiRes(page, {
+          x0: nx0 * vp1.width, y0: ny0 * vp1.height,
+          x1: nx1 * vp1.width, y1: ny1 * vp1.height,
+        }, padding / Math.max(0.2, pe?.scale || 1))
+        if (blob) return blob
+      } catch { /* 退回屏幕画布 */ }
+    }
     return cropPagePixels(sel.page,
-      Math.min(...xs) * canvas.width, Math.min(...ys) * canvas.height,
-      Math.max(...xs) * canvas.width, Math.max(...ys) * canvas.height, padding)
+      nx0 * canvas.width, ny0 * canvas.height,
+      nx1 * canvas.width, ny1 * canvas.height, padding)
   }
 
   // ---------- 公式框选模式：不经过文本层，直接拖一个矩形，避开 PDF.js 的文本顺序 ----------
@@ -434,13 +546,26 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     const peScale = pageEls.current.get(d.page)?.scale || 1
     const px0 = bx0 / peScale, py0 = by0 / peScale
     const px1 = bx1 / peScale, py1 = by1 / peScale
+    // 吸附打分：主键是"拖拽区有多少被这条公式占住"（交集/拖拽面积），而不是交集绝对面积 ——
+    // 否则一个包住两三条公式的大框会永远赢过精确的小框。同分取面积更小的区域；
+    // 覆盖度 <0.2 视为没碰到，保持手动框（拖在空白处时不要乱跳）。
+    const dragArea = Math.max(1e-6, (px1 - px0) * (py1 - py0))
     let best: FormulaRegion | null = null
+    let bestCover = 0
     let bestArea = 0
     for (const reg of formulaRegionsRef.current) {
       if (reg.page !== d.page) continue
       const ix = Math.max(0, Math.min(px1, reg.x1) - Math.max(px0, reg.x0))
       const iy = Math.max(0, Math.min(py1, reg.y1) - Math.max(py0, reg.y0))
-      if (ix * iy > bestArea) { best = reg; bestArea = ix * iy }
+      const cover = (ix * iy) / dragArea
+      if (cover < 0.2) continue
+      const area = Math.max(1e-6, (reg.x1 - reg.x0) * (reg.y1 - reg.y0))
+      if (!best || cover > bestCover + 1e-9
+        || (cover >= bestCover - 1e-9 && area < bestArea)) {
+        best = reg
+        bestCover = cover
+        bestArea = area
+      }
     }
     if (best) {
       bx0 = best.x0 * peScale
@@ -448,13 +573,18 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       bx1 = best.x1 * peScale
       by1 = best.y1 * peScale
     } else {
-      // 没有公式 bbox 时（例如新模板/扫描件），把框内碰到的文字 span 完整包进来，
-      // 补上用户框选时漏掉的上下标。
+      // 没有公式区域时（新模板/扫描件），把"框里占了一半以上"的 span 完整包进来，
+      // 补上用户框选时漏掉的上下标。既不能"碰到就扩"（框边擦到上一行，整行正文
+      // 都会被拉进来），也不能只看中心（中心刚压线的半行同样会进来）。
+      const bx0p = pr.left + bx0, bx1p = pr.left + bx1
+      const by0p = pr.top + by0, by1p = pr.top + by1
       for (const span of d.el.querySelectorAll<HTMLElement>('.textLayer span')) {
         if (!span.textContent) continue
         const sr = span.getBoundingClientRect()
-        if (sr.right < pr.left + bx0 || sr.left > pr.left + bx1) continue
-        if (sr.bottom < pr.top + by0 || sr.top > pr.top + by1) continue
+        if (!sr.width || !sr.height) continue
+        const ix = Math.max(0, Math.min(bx1p, sr.right) - Math.max(bx0p, sr.left))
+        const iy = Math.max(0, Math.min(by1p, sr.bottom) - Math.max(by0p, sr.top))
+        if ((ix * iy) / (sr.width * sr.height) < 0.5) continue
         bx0 = Math.min(bx0, sr.left - pr.left)
         bx1 = Math.max(bx1, sr.right - pr.left)
         by0 = Math.min(by0, sr.top - pr.top)
@@ -463,15 +593,21 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     }
     const kx = canvas.width / pr.width
     const ky = canvas.height / pr.height
-    const x0 = bx0 * kx
-    const y0 = by0 * ky
-    const x1 = bx1 * kx
-    const y1 = by1 * ky
+    // 只留 2px 余量（防止把反锯齿边缘切掉）。以前手动框是 12px，等于硬把
+    // 上下一行正文往里圈，用户看到的就是"裁的比框的大"。
+    const padPx = 2
     selecting.current = true
     window.setTimeout(() => { selecting.current = false }, 350)
     setFormulaMode(false)
-    cropPagePixels(d.page, x0, y0, x1, y1, best ? 2 : 12).then((blob) => {
-      if (blob) onFormulaCrop?.(blob, e.clientX, e.clientY)
+    // 先按 pt 坐标重渲染这块（清晰度与窗口缩放无关），失败再退回到屏幕画布裁剪
+    cropHiRes(d.page, {
+      x0: bx0 / peScale, y0: by0 / peScale,
+      x1: bx1 / peScale, y1: by1 / peScale,
+    }, padPx / peScale).then((blob) => {
+      if (blob) { onFormulaCrop?.(blob, e.clientX, e.clientY); return }
+      cropPagePixels(d.page, bx0 * kx, by0 * ky, bx1 * kx, by1 * ky, padPx).then((b) => {
+        if (b) onFormulaCrop?.(b, e.clientX, e.clientY)
+      })
     })
   }
 
@@ -497,6 +633,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       setErr('')
     pdfjs.getDocument({ url, wasmUrl: WASM_URL }).promise.then(async (doc) => {
       if (dead) return
+      docRef.current = doc
       const first = await doc.getPage(1)
       baseW.current = first.getViewport({ scale: 1 }).width
       if (fittedUrl.current !== url) {
@@ -561,6 +698,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       }
       pdfjs.TextLayer.cleanup()
       if (!dead) drawHighlights()
+      if (!dead) drawFormulaDebug()
       if (failed.length && !dead) {
         const shown = failed.slice(0, 6).join('、')
         setErr(`${failed.length}/${doc.numPages} 页渲染失败（第 ${shown}${failed.length > 6 ? ' 等' : ''} 页），其余页正常`)
@@ -569,6 +707,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     }).catch((e) => { if (!dead) setErr(String(e?.message || e)) })
     return () => {
       dead = true
+      docRef.current = null
       textLayers.current.forEach((t) => t.cancel())
       textLayers.current = []
     }
@@ -588,6 +727,9 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
 
   // 标亮数据变化（新增/换色/删除）或重新渲染后重画覆盖层
   useEffect(() => { drawHighlights() }, [highlights, scale])
+
+  // 公式区域变化时重画调试框（`?debug=formula`，页面还没渲染时由渲染流程末尾补画）
+  useEffect(() => { drawFormulaDebug() }, [formulaRegions, scale, url])
 
   // 原生 Ctrl+C 的兜底：把 Symbol 字体的私用区字符映射成 Unicode，
   // 并清理 PDF.js 文本层的多余空白；公式结构仍由「识别公式」处理。

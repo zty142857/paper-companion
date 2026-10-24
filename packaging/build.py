@@ -43,6 +43,26 @@ RELEASE = os.path.join(ROOT, "release")
 
 APP_NAME = "paper-companion"
 
+# 公式 OCR 模型：public/models 下是源码副本，构建时由 vite 复制进 dist
+MODEL_DIR = os.path.join(FRONTEND, "public", "models", "formulanet")
+MODEL_FILES = (
+    os.path.join("onnx", "encoder_model.onnx"),
+    os.path.join("onnx", "decoder_model_merged.onnx"),
+)
+
+# PyMuPDF 2.0 的 page.get_layout() 默认组合是 feature_set_name='imf+rf'、
+# table_grid_model_ver='V4'（别名到 V4-EP），只会读下面这几个文件。
+# 包里另外十几个模型是给其他参数组合准备的，项目没有用到，打包时裁掉。
+LAYOUT_KEEP = (
+    "layout_rf2.4.1+imf1.onnx",
+    "layout_rf2.4.1+imf1.yaml",
+    "feature_imf1.onnx",
+    "table_grid_model_v4_ep.onnx",
+)
+
+# onnxruntime 的模型转换 / 量化工具链只在开发期用，运行时只需要 capi 下的动态库
+ONNXRUNTIME_DROP = ("transformers", "quantization", "tools", "datasets")
+
 LAUNCHER_WIN = """@echo off
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -116,6 +136,106 @@ def ensure_pdfjs_wasm() -> None:
     run(["node", os.path.join("scripts", "copy-pdfjs-wasm.mjs")], cwd=FRONTEND)
 
 
+def _missing_model_files(root: str) -> list[str]:
+    return [name for name in MODEL_FILES if not os.path.isfile(os.path.join(root, name))]
+
+
+def ensure_formula_model(allow_missing: bool) -> None:
+    """公式模型不随仓库提交，缺了就打出一个“公式识别不可用”的包。
+    这里在构建前显式拦一下，避免再产出体积正常但功能残缺的发行包。"""
+    missing = _missing_model_files(MODEL_DIR)
+    if not missing:
+        return
+    hint = ("缺少公式模型：" + "、".join(missing) +
+            "\n先在 frontend 目录运行 `npm run model:download`（约 77MB），"
+            "或加 --allow-missing-model 打一个不含公式识别的包。")
+    if allow_missing:
+        print("警告：" + hint, flush=True)
+    else:
+        raise SystemExit(hint)
+
+
+def ensure_dist_model(allow_missing: bool) -> None:
+    """--skip-npm 会复用旧 dist，旧 dist 可能是在模型下载前构建的（里面没有模型），
+    这时把 public/models 补进去，保证发行包内容和源码一致。"""
+    dist_model = os.path.join(FRONTEND, "dist", "models", "formulanet")
+    if not _missing_model_files(dist_model):
+        return
+    if not _missing_model_files(MODEL_DIR):
+        src = os.path.join(FRONTEND, "public", "models", "formulanet")
+        os.makedirs(os.path.dirname(dist_model), exist_ok=True)
+        shutil.copytree(src, dist_model, dirs_exist_ok=True)
+        print("提示：已把公式模型补进 frontend/dist", flush=True)
+        return
+    if not allow_missing:
+        raise SystemExit("frontend/dist 里没有公式模型，且 public/models 也不完整，无法打包。")
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _remove(path: str) -> int:
+    """删文件或目录，返回释放的字节数。"""
+    if not os.path.exists(path):
+        return 0
+    size = _dir_size(path) if os.path.isdir(path) else os.path.getsize(path)
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    except OSError as exc:
+        print(f"警告：删除 {path} 失败（{exc}）", flush=True)
+        return 0
+    return size
+
+
+def prune_bundle(built: str) -> None:
+    """PyInstaller 会把整包 collect 进来，这里删掉运行时不用的文件。
+    都是确定不参与运行的数据/工具链，删除后功能不变。"""
+    internal = os.path.join(built, "_internal")
+    if not os.path.isdir(internal):
+        internal = built
+    freed = 0
+
+    # PyMuPDF 的编译头文件（给二次开发用的，运行不需要）
+    freed += _remove(os.path.join(internal, "pymupdf", "mupdf-devel"))
+
+    # 只保留默认 get_layout() 会加载的 layout 模型；其余版本没有代码引用。
+    # 若 PyMuPDF 升级后模型改名，白名单校验会失败，这时宁可不裁剪也不要打坏包。
+    onnx_dir = os.path.join(internal, "pymupdf", "layout", "resources", "onnx")
+    if os.path.isdir(onnx_dir):
+        missing = [name for name in LAYOUT_KEEP if not os.path.isfile(os.path.join(onnx_dir, name))]
+        if missing:
+            print("警告：未找到预期的 layout 模型（" + "、".join(missing) +
+                  "），跳过模型裁剪。请检查 PyMuPDF 版本的默认模型是否改了名。", flush=True)
+        else:
+            for name in os.listdir(onnx_dir):
+                if name not in LAYOUT_KEEP:
+                    freed += _remove(os.path.join(onnx_dir, name))
+
+    # onnxruntime 的模型转换工具链只在开发期用
+    for name in ONNXRUNTIME_DROP:
+        freed += _remove(os.path.join(internal, "onnxruntime", name))
+
+    # collect-all 偶尔会把 __pycache__ 当数据带进来
+    for root, dirs, _files in os.walk(internal):
+        for name in list(dirs):
+            if name == "__pycache__":
+                freed += _remove(os.path.join(root, name))
+                dirs.remove(name)
+
+    print(f"已精简打包产物：释放 {freed / 1024 / 1024:.1f} MB", flush=True)
+
+
 def build_frontend(skip: bool) -> None:
     if skip:
         if not os.path.isdir(os.path.join(FRONTEND, "dist")):
@@ -142,6 +262,10 @@ def build_backend() -> str:
         "--paths", BACKEND,
         "--add-data", add_data,
         "--collect-all", "pymupdf",
+        # 公式/表格区域检测用 PyMuPDF 2.0 的版面模型，模型文件在 pymupdf/layout/resources 下，
+        # 推理走 onnxruntime（延时 import，PyInstaller 扫不到，必须显式收集）。
+        "--collect-all", "onnxruntime",
+        "--hidden-import", "pymupdf.layout",
         "--collect-submodules", "uvicorn",
         "--hidden-import", "multipart",
         "--hidden-import", "uvicorn.logging",
@@ -151,6 +275,7 @@ def build_backend() -> str:
     out = os.path.join(PY_DIST, APP_NAME)
     if not os.path.isdir(out):
         raise SystemExit(f"打包失败，未找到输出目录：{out}")
+    prune_bundle(out)
     return out
 
 
@@ -217,7 +342,7 @@ def archive(stage: str, target: str) -> str:
             tar.add(stage, arcname=os.path.basename(stage), filter=filt)
     else:
         out = os.path.join(RELEASE, f"{APP_NAME}-{target}.zip")
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             base = os.path.dirname(stage)
             for folder, _dirs, files in os.walk(stage):
                 if skip_personal_data(folder):
@@ -235,12 +360,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", default=None, help="产物命名，如 win-x64 / macos-arm64 / linux-x64")
     ap.add_argument("--skip-npm", action="store_true", help="跳过 npm 构建，复用 frontend/dist")
+    ap.add_argument("--allow-missing-model", action="store_true",
+                    help="缺少公式模型时仍然打包（发行包将不带公式识别）")
     args = ap.parse_args()
 
     target = args.target or detect_target()
     print(f"target = {target}")
 
+    ensure_formula_model(args.allow_missing_model)
     build_frontend(args.skip_npm)
+    ensure_dist_model(args.allow_missing_model)
     built = build_backend()
     stage, kept_data = make_release(built, target)
     out = archive(stage, target)

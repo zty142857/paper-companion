@@ -19,7 +19,10 @@ release/
 # 项目内部文档与比赛方案：不进仓库，只留本地
 PROJECT.md
 *.docx
-*:WPSSyncID
+*WPSSyncID*
+
+# 编码助手本地技能目录（工具缓存，不属于项目）
+.agents/
 
 # 公式 OCR 模型（本地缓存，约 77MB，不入库）
 frontend/public/models/

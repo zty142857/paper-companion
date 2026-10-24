@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-pymupdf
+pymupdf>=2.0,<3   # 版面模型（page.get_layout）随 wheel 发布，公式区域检测依赖它
 httpx
 openai
 python-multipart

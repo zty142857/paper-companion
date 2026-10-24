@@ -168,7 +168,14 @@ def pdf(pid: str):
     p = db.get_paper(pid)
     if not p:
         raise HTTPException(404, "not found")
-    return FileResponse(p["pdf_path"], media_type="application/pdf",
+    path = p["pdf_path"]
+    if not path or not os.path.isfile(path):
+        # 数据目录搬过家（换机器/换系统）后库里存的绝对路径会失效，按 id 回数据目录找
+        guess = os.path.join(db.PDF_DIR, f"{pid}.pdf")
+        if not os.path.isfile(guess):
+            raise HTTPException(404, "PDF 文件不存在")
+        path = guess
+    return FileResponse(path, media_type="application/pdf",
                         headers={"Content-Disposition": "inline"})
 
 

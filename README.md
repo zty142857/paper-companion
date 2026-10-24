@@ -182,7 +182,7 @@ export PATH="$HOME/.local/bin:$PATH"     # 或加入 ~/.bashrc
 # 3. 装依赖
 cd paper-companion
 uv venv backend/.venv --python 3.14
-uv pip install -p backend/.venv fastapi "uvicorn[standard]" pymupdf httpx openai python-multipart
+uv pip install -p backend/.venv fastapi "uvicorn[standard]" "pymupdf>=2.0,<3" httpx openai python-multipart
 cd frontend && npm install && npm install pdfjs-dist @rolldown/binding-linux-x64-gnu && cd ..
 
 # 4. 启动
@@ -199,7 +199,7 @@ brew install node uv
 # 2. 装依赖
 cd paper-companion
 uv venv backend/.venv --python 3.14
-uv pip install -p backend/.venv fastapi "uvicorn[standard]" pymupdf httpx openai python-multipart
+uv pip install -p backend/.venv fastapi "uvicorn[standard]" "pymupdf>=2.0,<3" httpx openai python-multipart
 cd frontend && npm install && cd ..
 
 # 3. 启动
@@ -221,7 +221,7 @@ bash start.sh
 # 2. 装依赖
 cd paper-companion
 uv venv backend\.venv --python 3.14
-uv pip install -p backend\.venv fastapi "uvicorn[standard]" pymupdf httpx openai python-multipart
+uv pip install -p backend\.venv fastapi "uvicorn[standard]" "pymupdf>=2.0,<3" httpx openai python-multipart
 cd frontend; npm install; cd ..
 
 # 3. 分别起后端和前端（start.sh 是 bash 脚本，Windows 下用两条命令）
@@ -246,6 +246,9 @@ bash start.sh     # 检查依赖 → 关掉旧后端 → 起后端 → 起前端
 python packaging/build.py --target win-x64      # 或 linux-x64 / macos-x64 / macos-arm64
 ```
 产物在 `release/`。推 `v*` tag 会由 GitHub Actions 自动在四个平台上构建并发布到 Releases。
+
+打包前需要有公式模型（`frontend/public/models/formulanet`，用 `npm run model:download` 下载）；缺模型时会直接报错，确认要打一个不含公式识别的包时加 `--allow-missing-model`。
+构建过程会自动裁掉运行时不用的文件（PyMuPDF 里未使用的版面模型、`mupdf-devel` 编译头、onnxruntime 的模型转换工具链），详见 `prune_bundle()`。
 
 ---
 

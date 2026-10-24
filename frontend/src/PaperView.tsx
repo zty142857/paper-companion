@@ -172,9 +172,16 @@ export default function PaperView({ id }: { id: string }) {
   const blockMap: Record<string, Block> = useMemo(
     () => Object.fromEntries(blocks.map((b) => [b.id, b])), [blocks])
 
-  // 把后端解析出的 formula 块（以及含 PUA 的公式片段）按页聚类成整段公式 bbox。
-  // 公式框选时用它吸附到完整公式，避免把上下正文裁进 OCR。
+  // 公式区域，供框选吸附。新解析结果直接用后端版面模型给出的整条公式框（已裁掉编号）；
+  // 老论文（没有 formulas 字段）沿用 formula 块 + PUA 片段聚类。
+  // 新格式不再混入旧规则：旧规则会把单独的编号块当公式，反而把裁掉的 "(12)" 又拼回去。
   const formulaRegions = useMemo(() => {
+    const stored = paper?.structure.formulas
+    if (Array.isArray(stored)) {
+      return stored
+        .filter((f) => f.x1 - f.x0 > 8 && f.y1 - f.y0 > 4)
+        .map((f) => ({ page: f.page, x0: f.x0, y0: f.y0, x1: f.x1, y1: f.y1 }))
+    }
     const isFormula = (b: Block) => {
       if (b.type === 'formula') return true
       const t = b.text || ''
@@ -197,7 +204,7 @@ export default function PaperView({ id }: { id: string }) {
       }
     }
     return groups.filter((g) => g.x1 - g.x0 > 8 && g.y1 - g.y0 > 4)
-  }, [blocks])
+  }, [blocks, paper?.structure.formulas])
 
   // 双栏页的 col=0 内容归左轨；单栏页（或单栏论文）全部归右轨。
   const pageCols = useMemo(() => {

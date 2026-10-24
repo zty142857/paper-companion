@@ -17,6 +17,11 @@ from dataclasses import dataclass, asdict
 
 import pymupdf
 
+try:                       # 支持 `python -m app.pdf_parse` 与直接运行脚本两种方式
+    from . import formula_regions
+except ImportError:        # pragma: no cover
+    import formula_regions
+
 # ---------- 标题编号模式 ----------
 # 带点阿拉伯编号："2." "3.2.4."（IEEE/Elsevier/SAGE 等）
 HEAD_NUM_DOT_RE = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,3})\.(?:\s+(?=[A-Za-z(])|$)")
@@ -837,12 +842,23 @@ def parse_pdf(path: str) -> dict:
             title = guess
     else:
         title = guess or meta
+    # 公式区域：写入 structure["formulas"]，前端拖选时吸附到整条公式。
+    # 不走 blocks（block id 是顺序生成的，插入会让已存的卡片锚点错位）。
+    try:
+        formulas = formula_regions.extract_formulas(doc)
+    except Exception:
+        formulas = []
     doc.close()
+    blocks_out = [asdict(b) for b in blocks]
+    # 公式文字从正文里拿掉：只删 >=90% 落在公式框内的 para 块（约占字符数 3%），
+    # 部分覆盖的块保留，避免误删"正文 + 行内公式"混排的段落。
+    blocks_out = formula_regions.drop_formula_paragraphs(blocks_out, formulas)
     return {
         "title": title,
         "pages": n_pages,
-        "blocks": [asdict(b) for b in blocks],
+        "blocks": blocks_out,
         "sections": [asdict(s) for s in sections],
+        "formulas": formulas,
     }
 
 

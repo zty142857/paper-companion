@@ -13,7 +13,15 @@ export interface Card {
   id: string; paper_id: string; type: string; block_id: string; top: number
   data: Record<string, any>; created_at: number
 }
-export interface Structure { title: string; pages: number; blocks: Block[]; sections: Section[] }
+export interface FormulaBox {
+  page: number; x0: number; y0: number; x1: number; y1: number
+  number?: string | null; src?: string
+}
+export interface Structure {
+  title: string; pages: number; blocks: Block[]; sections: Section[]
+  /** 后端版面模型给出的整条公式框（1.0 解析器新增；老论文没有这个字段） */
+  formulas?: FormulaBox[]
+}
 export interface Paper {
   id: string; title: string; filename: string; pages: number
   structure: Structure; analysis: Analysis | null; status: string
