@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as pdfjs from 'pdfjs-dist'
 import workerUrl from './pdf.worker?worker&url'
-import type { Highlight } from './api'
+import type { Highlight, TableBox } from './api'
 
 // workerSrc 指向自建 worker 入口（见 pdf.worker.ts）：它会在启动 pdf.js worker 前补上
 // Map.prototype.getOrInsertComputed 等新内置方法，否则旧内核浏览器整篇 PDF 渲染失败。
@@ -34,6 +34,8 @@ export interface ViewerHandle {
   blockTop: (page: number, y0: number, rail: HTMLElement) => number | null
   flashText: (page: number, query: string) => boolean
   selectionImage: (sel: SelectedText, padding?: number) => Promise<Blob | null>
+  cropTable: (page: number, box: { x0: number; y0: number; x1: number; y1: number },
+    padding?: number) => Promise<Blob | null>
   clearSelection: () => void
 }
 
@@ -96,6 +98,8 @@ interface Props {
   onFormulaCrop?: (blob: Blob, x: number, y: number) => void
   formulaRegions?: FormulaRegion[]
   onHighlightClick?: (h: Highlight, x: number, y: number) => void
+  tables?: TableBox[]
+  onTableClick?: (table: TableBox, x: number, y: number) => void
 }
 
 function hitIn(pages: Map<number, { el: HTMLDivElement; scale: number }>, blocks: HitBlock[], x: number, y: number) {
@@ -198,7 +202,8 @@ function renderPage(page: any, opts: any, slowMs: number, onSlow: () => void): P
 }
 
 export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout,
-  highlights = [], onSelectText, onFormulaCrop, formulaRegions = [], onHighlightClick }: Props) {
+  highlights = [], onSelectText, onFormulaCrop, formulaRegions = [], onHighlightClick,
+  tables = [], onTableClick }: Props) {
   const box = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(DEFAULT_SCALE)
   const [err, setErr] = useState('')
@@ -216,6 +221,8 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   onHighlightClickRef.current = onHighlightClick
   const formulaRegionsRef = useRef<FormulaRegion[]>(formulaRegions)
   formulaRegionsRef.current = formulaRegions
+  const tablesRef = useRef<TableBox[]>(tables)
+  tablesRef.current = tables
   const [formulaMode, setFormulaMode] = useState(false)
   const formulaDrag = useRef<{
     page: number; el: HTMLDivElement; box: HTMLDivElement
@@ -441,14 +448,32 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   }
 
   const cropHiRes = async (page: number,
-    box: { x0: number; y0: number; x1: number; y1: number }, padPt: number) => {
+    box: { x0: number; y0: number; x1: number; y1: number }, padPt: number,
+    target = OCR_LONG_SIDE) => {
     const doc = docRef.current
     if (!doc) return null
     try {
-      return await cropRegionHiRes(await doc.getPage(page), box, padPt)
+      return await cropRegionHiRes(await doc.getPage(page), box, padPt, target)
     } catch {
       return null
     }
+  }
+
+  /** 表格截图：长边按 1600px 重渲染；失败退回当前屏幕画布。 */
+  const cropTable = async (page: number,
+    box: { x0: number; y0: number; x1: number; y1: number }, padding = 4) => {
+    const blob = await cropHiRes(page, box, padding, 1600)
+    if (blob) return blob
+    const pe = pageEls.current.get(page)
+    const canvas = pe?.el.querySelector('canvas')
+    if (!pe || !canvas) return null
+    const pr = pe.el.getBoundingClientRect()
+    if (!pr.width || !pr.height) return null
+    const kx = canvas.width / pr.width
+    const ky = canvas.height / pr.height
+    return cropPagePixels(page,
+      box.x0 * pe.scale * kx, box.y0 * pe.scale * ky,
+      box.x1 * pe.scale * kx, box.y1 * pe.scale * ky, 8)
   }
 
   /** 把当前选区所在的区域截成 PNG（优先高分辨率重渲染），供公式 OCR 使用。 */
@@ -752,11 +777,34 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
 
   // 滑块连续拖动：先即时更新百分比，停止拖动 200ms 后再重排渲染
   const [displayScale, setDisplayScale] = useState(scale)
+  const autoFit = useRef(true)      // 处于「适配」模式时，窗口变化后自动重算
+  const scaleRef = useRef(scale)
+  scaleRef.current = scale
   const slide = (v: number) => {
     setDisplayScale(v)
     if (renderTimer.current) window.clearTimeout(renderTimer.current)
     renderTimer.current = window.setTimeout(() => setScale(v), 200)
   }
+  // 手动缩放后不再跟随窗口自动适配；点「适配」恢复
+  const manualSlide = (v: number) => { autoFit.current = false; slide(v) }
+
+  useEffect(() => {
+    const el = box.current
+    if (!el) return
+    let timer: number | null = null
+    const ro = new ResizeObserver(() => {
+      if (!autoFit.current) return
+      if (timer) window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        const t = fitScale()
+        if (t != null && Math.abs(t - scaleRef.current) > 0.01) {
+          setDisplayScale(t); setScale(t)
+        }
+      }, 160)
+    })
+    ro.observe(el)
+    return () => { ro.disconnect(); if (timer) window.clearTimeout(timer) }
+  }, [])
 
   useEffect(() => {
     onReady?.({
@@ -775,6 +823,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       },
       flashText,
       selectionImage,
+      cropTable,
       clearSelection: () => window.getSelection()?.removeAllRanges(),
     })
   }, [onReady])
@@ -860,11 +909,36 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     })
   }
 
+  const tableAt = (x: number, y: number): TableBox | null => {
+    for (const [pno, pe] of pageEls.current) {
+      const r = pe.el.getBoundingClientRect()
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue
+      const px = (x - r.left) / pe.scale
+      const py = (y - r.top) / pe.scale
+      const hits = tablesRef.current.filter((t) => t.page === pno
+        && px >= t.x0 - 2 && px <= t.x1 + 2 && py >= t.y0 - 1 && py <= t.y1 + 1)
+      if (!hits.length) return null
+      return hits.sort((a, b) =>
+        (a.x1 - a.x0) * (a.y1 - a.y0) - (b.x1 - b.x0) * (b.y1 - b.y0))[0]
+    }
+    return null
+  }
+
+  const hoverTable = (e: React.PointerEvent) => {
+    if (formulaDrag.current || formulaMode) return
+    if (box.current) box.current.style.cursor = tableAt(e.clientX, e.clientY) ? 'zoom-in' : ''
+  }
+
   const click = (e: React.MouseEvent) => {
     if (formulaMode || selecting.current || window.getSelection()?.toString().trim()) return
     const target = e.target as HTMLElement
-    if (target.closest('.card') || target.closest('.toolbar-pop')) return
+    if (target.closest('.card') || target.closest('.toolbar-pop') || target.closest('.table-pop')) return
     if (!target.closest('.page')) return
+    const table = tableAt(e.clientX, e.clientY)
+    if (table) {
+      onTableClick?.(table, e.clientX, e.clientY)
+      return
+    }
     const id = hitIn(pageEls.current, blocks, e.clientX, e.clientY)
     if (id) onBlockClick?.(id, e.clientX, e.clientY)
   }
@@ -873,12 +947,12 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     <div className={formulaMode ? 'viewer formula-mode' : 'viewer'}>
       <div className="zoombar">
         <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 8 }}>缩放</span>
-        <button className="btn small" onClick={() => slide(clampScale(displayScale - 0.1))}>−</button>
+        <button className="btn small" onClick={() => manualSlide(clampScale(displayScale - 0.1))}>−</button>
         <input type="range" className="zoom-slider" min={MIN_SCALE} max={MAX_SCALE} step={0.05}
-          value={displayScale} onChange={(e) => slide(+e.target.value)} />
-        <button className="btn small" onClick={() => slide(clampScale(displayScale + 0.1))}>+</button>
+          value={displayScale} onChange={(e) => manualSlide(+e.target.value)} />
+        <button className="btn small" onClick={() => manualSlide(clampScale(displayScale + 0.1))}>+</button>
         <button className="btn small" title="贴合阅读区宽度"
-          onClick={() => { const t = fitScale(); if (t != null) slide(t) }}>适配</button>
+          onClick={() => { const t = fitScale(); if (t != null) { autoFit.current = true; slide(t) } }}>适配</button>
         <button className={formulaMode ? 'btn small primary' : 'btn small'}
           title="拖拽框住一个公式，松开后自动识别为 LaTeX"
           onClick={() => {
@@ -888,15 +962,16 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
           }}>∑ 框选公式</button>
         <span style={{ fontSize: 12, color: 'var(--muted)', width: 42, textAlign: 'right' }}>
           {Math.round(displayScale * 100)}%</span>
-        <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 'auto', marginRight: 8 }}>
+        <span className="zoombar-hint" style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 'auto', marginRight: 8 }}>
           {formulaMode ? '拖拽框住一个公式，松开自动识别；Esc 取消' : '拖选文字可标亮 · 点击段落可翻译 / 提问'}
         </span>
         {err && <span className="err">渲染失败：{err}</span>}
       </div>
       <div ref={box} onClick={click} onMouseUp={up}
         onPointerDown={formulaDown}
-        onPointerMove={formulaMove}
-        onPointerUp={formulaUp} onPointerCancel={cancelFormulaDrag} />
+        onPointerMove={(e) => { formulaMove(e); hoverTable(e) }}
+        onPointerUp={formulaUp} onPointerCancel={cancelFormulaDrag}
+        onPointerLeave={() => { if (box.current) box.current.style.cursor = '' }} />
     </div>
   )
 }

@@ -1,15 +1,17 @@
 import os
 import sys
+import json
+import time
 import shutil
 import threading
 import mimetypes
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import ai, db, llm, pdf_parse, profile, quiz, search, summarize
+from . import ai, db, llm, model_catalog, pdf_parse, profile, quiz, search, summarize, table_regions
 
 # Windows 的 MIME 注册表缺 .mjs 映射，默认会退化成 text/plain，
 # 浏览器对 import() 的模块有 MIME 校验，会拒绝加载 PDF.js worker。
@@ -19,6 +21,14 @@ mimetypes.add_type("text/javascript", ".js")
 app = FastAPI(title="paper-companion")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 db.init()
+llm.ensure_migrated()
+
+
+@app.exception_handler(llm.LLMNotConfigured)
+def _llm_not_configured(request: Request, exc: llm.LLMNotConfigured):
+    """把「没配模型」变成前端能直接展示的 400，而不是 500。"""
+    return JSONResponse(status_code=400, content={
+        "detail": str(exc), "code": "model_not_configured", "purpose": exc.purpose})
 
 
 def _prefetch_domain_guess(pid: str, structure: dict):
@@ -161,6 +171,48 @@ def paper(pid: str):
         # 旧数据里术语可能没有 refs → 读取时按原文出现位置补齐，小卡才有锚点
         summarize.locate_term_refs(p["analysis"].get("terms") or [], p["structure"])
     return p
+
+
+_table_locks: dict[str, threading.Lock] = {}
+_table_locks_guard = threading.Lock()
+
+
+def _table_lock(pid: str) -> threading.Lock:
+    with _table_locks_guard:
+        lock = _table_locks.get(pid)
+        if lock is None:
+            lock = threading.Lock()
+            _table_locks[pid] = lock
+        return lock
+
+
+@app.get("/api/papers/{pid}/tables")
+def paper_tables(pid: str):
+    """老论文懒补表格；同一篇只跑一次，结果写回 structure。"""
+    p = db.get_paper(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    if p["structure"].get("tables_version") == table_regions.TABLES_VERSION:
+        return {"tables": p["structure"].get("tables") or [],
+                "version": table_regions.TABLES_VERSION}
+    path = p.get("pdf_path") or ""
+    if not path or not os.path.isfile(path):
+        guess = os.path.join(db.PDF_DIR, f"{pid}.pdf")
+        if not os.path.isfile(guess):
+            raise HTTPException(404, "PDF 文件不存在")
+        path = guess
+    with _table_lock(pid):
+        p = db.get_paper(pid) or p
+        st = p["structure"]
+        if st.get("tables_version") == table_regions.TABLES_VERSION:
+            return {"tables": st.get("tables") or [],
+                    "version": table_regions.TABLES_VERSION}
+        try:
+            tables = table_regions.ensure_tables(st, path)
+        except Exception as e:
+            raise HTTPException(500, f"表格识别失败：{e}")
+        db.set_structure(pid, st)
+        return {"tables": tables, "version": table_regions.TABLES_VERSION}
 
 
 @app.get("/api/papers/{pid}/pdf")
@@ -357,6 +409,7 @@ class ChatIn(BaseModel):
     block_ids: list[str] = []
     history: list[dict] = []
     question: str
+    table_id: str = ""
 
 
 @app.post("/api/papers/{pid}/chat")
@@ -369,7 +422,7 @@ def chat(pid: str, body: ChatIn):
     has_profile = bool(m.get("domain")) and bool(m.get("plan"))
     return ai.chat(p["structure"], body.block_ids, body.history, body.question,
                    familiarity=m.get("familiarity") if has_profile else None,
-                   analysis=p.get("analysis"))
+                   analysis=p.get("analysis"), table_id=body.table_id)
 
 
 # ---------------- 阶段三：档案 / 计划 / 检索 / 记忆 ----------------
@@ -665,43 +718,333 @@ def save_quiz_answers(pid: str, body: QuizAnswersIn):
     return {"ok": True}
 
 
-class Settings(BaseModel):
+# ---------------- 模型提供商 / 用途路由 ----------------
+
+# 模型列表里的非对话模型（向量/重排/语音/绘图），自动启用时跳过
+_SKIP_MODEL_HINTS = ("embed", "rerank", "whisper", "tts", "moderation", "dall-e",
+                     "davinci", "transcribe", "speech", "audio", "ocr",
+                     "stable-diffusion", "flux", "sdxl", "bge-", "gte-", "clip")
+
+
+def _mask_key(key: str) -> str:
+    key = key or ""
+    return (key[:4] + "****" + key[-4:]) if len(key) > 10 else ("已设置" if key else "")
+
+
+def _routes_raw() -> dict:
+    out = {}
+    for purpose in llm.PURPOSES:
+        raw = db.get_setting(f"llm_route_{purpose}") or ""
+        try:
+            val = json.loads(raw) if raw else {}
+        except ValueError:
+            val = {}
+        out[purpose] = val if isinstance(val, dict) else {}
+    return out
+
+
+def _routes_out() -> dict:
+    raw = _routes_raw()
+    out = {}
+    for purpose in llm.PURPOSES:
+        r = raw.get(purpose) or {}
+        prov = db.get_provider(r.get("provider_id") or "")
+        out[purpose] = {
+            "provider_id": r.get("provider_id") or "",
+            "provider_name": (prov.get("name") or "") if prov else "",
+            "model": r.get("model") or "",
+            "effort": r.get("effort") or "",
+            "configured": bool(prov and (r.get("model") or "").strip()),
+        }
+    return out
+
+
+def _provider_out(p: dict, routes: dict | None = None) -> dict:
+    routes = routes if routes is not None else _routes_raw()
+    key = p.get("api_key") or ""
+    m = p.get("models") or {}
+    cat = model_catalog.preset(p.get("catalog_id"))
+    return {
+        "id": p["id"],
+        "name": p.get("name") or "",
+        "base_url": p.get("base_url") or "",
+        "api_key": _mask_key(key),
+        "has_key": bool(key),
+        "headers": p.get("headers") or {},
+        "catalog_id": p.get("catalog_id"),
+        "catalog_name": (cat or {}).get("name"),
+        "models": {
+            "enabled": m.get("enabled") or [],
+            "available": len(m.get("available") or []),
+            "fetched_at": m.get("fetched_at"),
+            "source": m.get("source") or "",
+        },
+        "in_use": [x for x in llm.PURPOSES if (routes.get(x) or {}).get("provider_id") == p["id"]],
+    }
+
+
+def _looks_chat(model_id: str) -> bool:
+    low = (model_id or "").lower()
+    return not any(h in low for h in _SKIP_MODEL_HINTS)
+
+
+def _models_payload(p: dict, ids: list[str], enabled: list[str], source: str,
+                    error: str = "") -> dict:
+    rows = []
+    cat = p.get("catalog_id")
+    for mid in ids:
+        info = model_catalog.model_info(cat, mid)
+        rows.append({
+            "id": mid,
+            "name": info.get("name") or mid,
+            "known": bool(info.get("known")),
+            "reasoning_options": info.get("reasoning_options") or [],
+            "context": (info.get("limit") or {}).get("context"),
+        })
+    return {"models": rows, "enabled": enabled, "source": source, "error": error,
+            "fetched_at": (p.get("models") or {}).get("fetched_at")}
+
+
+class ProviderIn(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    headers: dict[str, str] | None = None
+    catalog_id: str | None = None
+    clear_key: bool = False
+
+
+class TestIn(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
     effort: str | None = None
+    purpose: str = "default"
 
 
-@app.get("/api/settings")
-def get_settings():
-    cfg = llm.get_llm_config()
-    key = cfg["api_key"]
-    cfg["api_key"] = (key[:4] + "****" + key[-4:]) if len(key) > 10 else ("已设置" if key else "")
-    cfg["has_key"] = bool(key)
-    return cfg
+class ProviderModelsIn(BaseModel):
+    enabled: list[str] = []
 
 
-class SettingsTestIn(BaseModel):
-    base_url: str | None = None
-    api_key: str | None = None
-    model: str | None = None
+class RouteIn(BaseModel):
+    provider_id: str = ""
+    model: str = ""
+    effort: str = ""
 
 
-@app.post("/api/settings/test")
-def test_settings(body: SettingsTestIn | None = None):
-    """连通性自检：用表单当前值（未填/掩码项回落到已保存配置）发一次最小调用。"""
-    return llm.test_connection(body.model_dump() if body else None)
+class RoutesIn(BaseModel):
+    default: RouteIn | None = None
+    translate: RouteIn | None = None
 
 
-@app.put("/api/settings")
-def put_settings(s: Settings):
-    for k, v in s.model_dump(exclude_none=True).items():
-        if k == "api_key" and ("****" in (v or "") or v == "已设置"):
-            continue  # 前端回显的占位值不覆盖真实 key
-        if v is not None and v != "":
-            db.set_setting(f"llm_{k}", v)
-    llm.reset_capability_cache()   # 换了服务商/模型 → 重新探测 response_format 等参数支持
-    return get_settings()
+class ProbeIn(BaseModel):
+    provider_id: str
+    model: str
+    levels: list[str]
+
+
+@app.get("/api/providers")
+def list_providers():
+    routes = _routes_raw()
+    return [_provider_out(p, routes) for p in db.list_providers()]
+
+
+@app.get("/api/provider-presets")
+def provider_presets():
+    """内置目录里的 OpenAI 兼容提供方，供「添加提供商」一键预填。"""
+    return model_catalog.presets()
+
+
+@app.post("/api/providers")
+def create_provider(body: ProviderIn):
+    cat = model_catalog.preset(body.catalog_id) if body.catalog_id else None
+    base_url = (body.base_url or (cat or {}).get("api") or "").strip()
+    if not base_url:
+        raise HTTPException(400, "请填写 Base URL，或从内置目录里选一个提供商")
+    name = (body.name or (cat or {}).get("name") or llm.suggest_name(base_url)).strip()
+    pid = db.add_provider(
+        name=name,
+        base_url=base_url,
+        api_key=(body.api_key or "").strip(),
+        headers=body.headers or {},
+        catalog_id=body.catalog_id or (cat or {}).get("id"),
+    )
+    llm.reset_capability_cache()
+    return _provider_out(db.get_provider(pid))
+
+
+@app.put("/api/providers/{pid}")
+def update_provider(pid: str, body: ProviderIn):
+    p = db.get_provider(pid)
+    if not p:
+        raise HTTPException(404, "提供商不存在")
+    fields = {}
+    if body.name is not None and body.name.strip():
+        fields["name"] = body.name.strip()
+    if body.base_url is not None:
+        base_url = body.base_url.strip()
+        if not base_url:
+            raise HTTPException(400, "Base URL 不能为空")
+        fields["base_url"] = base_url
+        # 地址变了就重新按目录匹配一次（显式传 catalog_id 时不覆盖）
+        if body.catalog_id is None:
+            cat = model_catalog.guess_provider(base_url)
+            fields["catalog_id"] = cat["id"] if cat else None
+    if body.catalog_id is not None:
+        fields["catalog_id"] = body.catalog_id or None
+    if body.headers is not None:
+        fields["headers"] = body.headers
+    if body.clear_key:
+        fields["api_key"] = ""
+    elif body.api_key and "****" not in body.api_key and body.api_key != "已设置":
+        fields["api_key"] = body.api_key.strip()
+    if fields:
+        db.update_provider(pid, **fields)
+        llm.reset_capability_cache()
+    return _provider_out(db.get_provider(pid))
+
+
+@app.delete("/api/providers/{pid}")
+def delete_provider(pid: str):
+    p = db.get_provider(pid)
+    if not p:
+        raise HTTPException(404, "提供商不存在")
+    used = []
+    for x in llm.PURPOSES:
+        try:
+            route = json.loads(db.get_setting(f"llm_route_{x}") or "{}")
+        except ValueError:
+            route = {}
+        if isinstance(route, dict) and route.get("provider_id") == pid:
+            used.append(llm.PURPOSE_LABELS[x])
+    if used:
+        raise HTTPException(409, f"这个提供商正在被「{'、'.join(used)}」使用，请先改成别的提供商")
+    db.delete_provider(pid)
+    llm.reset_capability_cache()
+    return {"ok": True}
+
+
+@app.post("/api/providers/{pid}/test")
+def test_provider(pid: str, body: TestIn | None = None):
+    """用表单当前值（未填/掩码项回落到已保存配置）发一次最小调用。"""
+    ov = body.model_dump(exclude_none=True) if body else {}
+    return llm.test_connection(pid, ov, purpose=(ov.pop("purpose", "default") or "default"))
+
+
+@app.post("/api/providers/{pid}/models/sync")
+def sync_provider_models(pid: str):
+    """实时拉 /v1/models；拉不到就回落到内置目录，并如实把失败原因带回前端。"""
+    p = db.get_provider(pid)
+    if not p:
+        raise HTTPException(404, "提供商不存在")
+    error, source, ids = "", "api", []
+    try:
+        client = llm.provider_client(p, timeout=20)
+        listing = client.models.list()
+        ids = sorted({m.id for m in listing.data if getattr(m, "id", None)})
+        if not ids:
+            raise RuntimeError("服务商返回了空模型列表")
+    except Exception as e:
+        source = "catalog"
+        error = llm.brief_error(e)
+        ids = [m["id"] for m in model_catalog.models(p.get("catalog_id"))]
+
+    prev = p.get("models") or {}
+    enabled = [m for m in (prev.get("enabled") or []) if m in ids]
+    if not enabled:
+        want = {(r.get("model") or "") for r in _routes_raw().values()}
+        enabled = [m for m in ids if m in want]
+    if not enabled:
+        enabled = [m for m in ids if _looks_chat(m)][:20]
+    if ids:
+        db.update_provider(pid, models={"available": ids, "enabled": enabled,
+                                        "fetched_at": time.time(), "source": source})
+    p = db.get_provider(pid)
+    return _models_payload(p, ids, enabled, source, error)
+
+
+@app.get("/api/providers/{pid}/models")
+def get_provider_models(pid: str):
+    p = db.get_provider(pid)
+    if not p:
+        raise HTTPException(404, "提供商不存在")
+    m = p.get("models") or {}
+    ids = m.get("available") or []
+    return _models_payload(p, ids, m.get("enabled") or [], m.get("source") or "")
+
+
+@app.put("/api/providers/{pid}/models")
+def save_provider_models(pid: str, body: ProviderModelsIn):
+    """保存启用清单（搜索 / 全选在前端完成，这里只落库）。"""
+    p = db.get_provider(pid)
+    if not p:
+        raise HTTPException(404, "提供商不存在")
+    m = p.get("models") or {}
+    available = set(m.get("available") or [])
+    enabled = []
+    for mid in body.enabled:
+        mid = (mid or "").strip()
+        if mid and mid not in enabled and (not available or mid in available):
+            enabled.append(mid)
+    db.update_provider(pid, models={**m, "enabled": enabled})
+    return {"ok": True, "enabled": enabled}
+
+
+@app.get("/api/model-info")
+def model_info(provider_id: str = "", model: str = ""):
+    prov = db.get_provider(provider_id)
+    info = model_catalog.model_info(prov.get("catalog_id") if prov else None, model)
+    return {
+        "known": bool(info.get("known")),
+        "name": info.get("name") or model,
+        "reasoning": bool(info.get("reasoning")),
+        "reasoning_options": info.get("reasoning_options") or [],
+        "limit": info.get("limit") or {},
+        "cost": info.get("cost") or {},
+    }
+
+
+@app.post("/api/settings/probe-efforts")
+def probe_efforts(body: ProbeIn):
+    """手动验证档位：逐个发最小请求，只证明服务商接受参数，不证明真的在思考。"""
+    return llm.probe_efforts(body.provider_id, body.model, body.levels)
+
+
+@app.get("/api/routes")
+def get_routes():
+    return _routes_out()
+
+
+@app.put("/api/routes")
+def put_routes(body: RoutesIn):
+    for purpose in llm.PURPOSES:
+        r = getattr(body, purpose)
+        if r is None:
+            continue
+        if not r.provider_id.strip() or not r.model.strip():
+            db.set_setting(f"llm_route_{purpose}",
+                           json.dumps({"provider_id": "", "model": "", "effort": ""}))
+            continue
+        prov = db.get_provider(r.provider_id)
+        if not prov:
+            raise HTTPException(400, "提供商不存在")
+        db.set_setting(f"llm_route_{purpose}", json.dumps({
+            "provider_id": prov["id"],
+            "model": r.model.strip(),
+            "effort": (r.effort or "").strip(),
+        }, ensure_ascii=False))
+    llm.reset_capability_cache()
+    return _routes_out()
+
+
+@app.post("/api/catalog/refresh")
+def refresh_catalog():
+    """联网更新 models.dev 目录快照（写到 data/catalog.json，不覆盖随包版本）。"""
+    try:
+        return model_catalog.refresh()
+    except Exception as e:
+        raise HTTPException(502, f"更新模型目录失败：{llm.brief_error(e)}")
+
 
 
 @app.post("/api/data/clear")

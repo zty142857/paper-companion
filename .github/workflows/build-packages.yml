@@ -22,6 +22,9 @@ jobs:
             target: win-x64
           - os: ubuntu-22.04
             target: linux-x64
+          # macOS Intel（macos-x64）暂无法构建：PyMuPDF 2.0 只发布 arm64 的 macOS wheel
+          # （onnxruntime 同样已停止发布 macOS x86_64 wheel），版面/表格功能依赖它，
+          # 强行从源码编译 MuPDF 也不现实。恢复构建前先确认上游恢复 x86_64 支持。
           - os: macos-14
             target: macos-arm64
 
@@ -102,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 下载四平台产物
+      - name: 下载三平台产物
         uses: actions/download-artifact@v4
         with:
           path: dist
@@ -129,9 +132,11 @@ jobs:
           解压即用，**不需要安装 Python 或 Node**。
 
           ### 本版亮点
-          - 公式框选改用版面模型：直接吸附到整条公式，并自动去掉右侧编号
-          - 老论文（旧版解析结果）继续沿用 PUA 片段启发式兜底，不用重新解析
-          - 发行包体积精简约 45MB：裁掉运行时不用的版面模型、编译头和工具链
+          - 模型设置重构：支持多提供商并存，「翻译」与「其他任务」可分别绑定不同提供商和模型（本地小模型翻译、云端模型做导读）
+          - 内置 200+ 家 OpenAI 兼容服务商目录（models.dev 离线快照），支持一键获取模型列表、搜索 / 全选
+          - 思考强度按模型能力动态显示，调用失败自动降级；本地 Ollama / LM Studio / vLLM 可留空 Key
+          - 新增表格阅读：点击表格查看 / 复制图片 / 「问这张表」；表题进入导读，表内文字不再污染正文摘要
+          - 公式框选继续使用版面模型：直接吸附到整条公式，并自动去掉右侧编号
           - 修复数据目录搬家后 PDF 打不开的问题
           - 公式识别仍是本地 OCR，模型随包提供，首次识别无需联网下载
 

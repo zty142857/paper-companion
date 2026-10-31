@@ -12,36 +12,27 @@ interface Props {
   onDelete: () => void
   onAsk: (q: string) => Promise<void>    // 发送子对话问题
   onJump: (page: number) => void
-  onResize: (w: number) => void          // 拖拽右边缘调整宽度（实时）
-  onResizeEnd: (w: number) => void       // 松手：落库
   onPatch: (data: Record<string, any>) => void   // 笔记等就地编辑后落库
-  maxWidth?: number                      // 左轨卡片限宽，避免盖住论文
 }
-
-const CARD_DEFAULT_W = 288
-const CARD_MIN_W = 220
-const CARD_MAX_W = 640
-const CARD_W_STEP = 1.08      // 双击缩放宽/高
 
 const TYPE_ICON: Record<string, string> = { translation: '🈶', chat: '💬', term: '📚', note: '📝' }
 
-export default function CardItem({ card, top, active, onActivate, onTop, onDrop, onDelete, onAsk, onJump, onResize, onResizeEnd, onPatch, maxWidth }: Props) {
+export default function CardItem({ card, top, active, onActivate, onTop, onDrop, onDelete, onAsk, onJump, onPatch }: Props) {
   const [open, setOpen] = useState(card.type === 'note' && !card.data?.text)
   const [q, setQ] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
   const [noteText, setNoteText] = useState<string>(card.data?.text ?? '')
-  const maxW = Math.min(CARD_MAX_W, Math.max(CARD_MIN_W, maxWidth ?? CARD_MAX_W))
-  const clampW = (w: number) => Math.round(Math.min(maxW, Math.max(CARD_MIN_W, w)))
-  const width = clampW(card.data.width ?? Math.min(CARD_DEFAULT_W, maxW))
   const drag = useRef<{ startY: number; startTop: number; moved: boolean } | null>(null)
   const dragged = useRef(false)
-  const resize = useRef<{ startX: number; startW: number } | null>(null)
   const d = card.data
   useEffect(() => { setNoteText(d.text ?? '') }, [card.id, d.text])
   const isGlobalChat = card.type === 'chat' && !!d.global
+  const isTableChat = card.type === 'chat' && !!d.table_id
   const title = card.type === 'translation' ? (d.pending ? '译文 · 翻译中…' : d.error ? '译文 · 失败' : `译文 · 第${d.page ?? '?'}页`)
-    : card.type === 'term' ? `术语 · ${d.term}` : card.type === 'note' ? '笔记' : isGlobalChat ? '子对话 · 🌐全文' : '子对话'
+    : card.type === 'term' ? `术语 · ${d.term}` : card.type === 'note' ? '笔记'
+      : isTableChat ? `表格 · ${String(d.table_caption || d.table_id).slice(0, 36)}`
+        : isGlobalChat ? '子对话 · 🌐全文' : '子对话'
   // 收起时也显示一段预览，避免用户以为卡片是空的
   const preview = card.type === 'translation'
     ? (d.error ? `翻译失败：${d.error}` : d.pending ? '翻译中…' : (d.translation || d.orig || ''))
@@ -71,26 +62,6 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
     if (!dragged.current) setOpen((o) => !o)
   }
 
-  const rdown = (e: React.PointerEvent) => {
-    e.stopPropagation()
-    resize.current = { startX: e.clientX, startW: width }
-    ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
-  }
-  const rmove = (e: React.PointerEvent) => {
-    if (!resize.current) return
-    onResize(clampW(resize.current.startW + e.clientX - resize.current.startX))
-  }
-  const rup = (e: React.PointerEvent) => {
-    if (!resize.current) return
-    resize.current = null
-    // 双击右边缘：在默认/放宽之间切换
-    const w = e.detail === 2
-      ? clampW(width > CARD_DEFAULT_W ? CARD_DEFAULT_W : CARD_DEFAULT_W * CARD_W_STEP * CARD_W_STEP)
-      : width
-    if (w !== width) onResize(w)
-    onResizeEnd(w)
-  }
-
   const ask = async () => {
     const t = q.trim()
     if (!t || busy) return
@@ -103,10 +74,10 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
   }
 
   return (
-    <div className={`card ${card.type}${active ? ' active' : ''}`} data-id={card.id} style={{ top, width }}
+    <div className={`card ${card.type}${active ? ' active' : ''}`} data-id={card.id} style={{ top }}
       onPointerDownCapture={onActivate}>
       <div className="ch" onPointerDown={down} onPointerMove={move} onPointerUp={up} onClick={clickHead}>
-        <span className="ico">{isGlobalChat ? '🌐' : (TYPE_ICON[card.type] ?? '📌')}</span>
+        <span className="ico">{isTableChat ? '▦' : isGlobalChat ? '🌐' : (TYPE_ICON[card.type] ?? '📌')}</span>
         <span className="ct">{title}</span>
         <button className="x toggle" title={open ? '收起' : '展开'} onClick={() => setOpen(!open)}>{open ? '▾' : '▸'}</button>
         {confirmDel ? (
@@ -164,8 +135,6 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
           </div>
         </>}
       </div>}
-      <div className="resizer" title="拖动调整宽度（双击复位）"
-        onPointerDown={rdown} onPointerMove={rmove} onPointerUp={rup} />
     </div>
   )
 }

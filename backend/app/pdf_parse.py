@@ -18,9 +18,10 @@ from dataclasses import dataclass, asdict
 import pymupdf
 
 try:                       # 支持 `python -m app.pdf_parse` 与直接运行脚本两种方式
-    from . import formula_regions
+    from . import formula_regions, table_regions
 except ImportError:        # pragma: no cover
     import formula_regions
+    import table_regions
 
 # ---------- 标题编号模式 ----------
 # 带点阿拉伯编号："2." "3.2.4."（IEEE/Elsevier/SAGE 等）
@@ -844,21 +845,42 @@ def parse_pdf(path: str) -> dict:
         title = guess or meta
     # 公式区域：写入 structure["formulas"]，前端拖选时吸附到整条公式。
     # 不走 blocks（block id 是顺序生成的，插入会让已存的卡片锚点错位）。
+    # 版面模型很贵（约 1.5s/页）：一次算好，公式和表格共用；表格页也只对这几页跑 to_json。
+    layouts = None
     try:
-        formulas = formula_regions.extract_formulas(doc)
+        layouts = formula_regions.page_layouts(doc)
+    except Exception:
+        layouts = None
+    try:
+        formulas = formula_regions.extract_formulas(doc, layouts=layouts)
     except Exception:
         formulas = []
-    doc.close()
     blocks_out = [asdict(b) for b in blocks]
     # 公式文字从正文里拿掉：只删 >=90% 落在公式框内的 para 块（约占字符数 3%），
     # 部分覆盖的块保留，避免误删"正文 + 行内公式"混排的段落。
     blocks_out = formula_regions.drop_formula_paragraphs(blocks_out, formulas)
+    # 表格区域：to_json 一次给出表框/单元格/表题；不删块，只打 table_id。
+    # 失败时 tables_version 留 0，前端打开时走懒补接口重试。
+    tables: list[dict] = []
+    tables_ok = False
+    if layouts is not None:
+        table_pages = [n for n, info in layouts.items()
+                       if info and any(str(e[4]) == "table" for e in info)]
+        try:
+            tables = table_regions.extract_tables(doc, blocks_out, pages=table_pages)
+            table_regions.tag_table_blocks(blocks_out, tables)
+            tables_ok = (not layouts) or any(info is not None for info in layouts.values())
+        except Exception:
+            tables = []
+    doc.close()
     return {
         "title": title,
         "pages": n_pages,
         "blocks": blocks_out,
         "sections": [asdict(s) for s in sections],
         "formulas": formulas,
+        "tables": tables,
+        "tables_version": table_regions.TABLES_VERSION if tables_ok else 0,
     }
 
 

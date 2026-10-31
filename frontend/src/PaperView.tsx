@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { api } from './api'
-import type { Block, Card, Highlight, Paper, ReadingPlan, Recommendation, SearchResult } from './api'
+import { api, TABLES_VERSION } from './api'
+import type { Block, Card, Highlight, Paper, ReadingPlan, Recommendation, SearchResult, TableBox } from './api'
 import PdfViewer, { HL_COLORS, HL_COLOR_NAMES } from './PdfViewer'
 import type { FormulaRegion, SelectedText, ViewerHandle } from './PdfViewer'
 import CardItem from './CardItem'
@@ -26,6 +26,18 @@ function secDepth(title: string): number {
 
 /** 未点击的术语小卡在 displayTops 里的键（与卡片 id 命名空间隔开） */
 const chipKey = (term: string) => `chip:${term}`
+
+/** 订阅一条媒体查询；只在跨越断点时触发一次重渲染 */
+function useMedia(query: string) {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches)
+  useEffect(() => {
+    const mq = window.matchMedia(query)
+    const onChange = () => setMatches(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [query])
+  return matches
+}
 
 export default function PaperView({ id }: { id: string }) {
   const [paper, setPaper] = useState<Paper | null>(null)
@@ -58,7 +70,29 @@ export default function PaperView({ id }: { id: string }) {
   const [sectionsOpen, setSectionsOpen] = useState(() => {
     try { return localStorage.getItem('pc.sectionsOpen') !== '0' } catch { return true }
   })
+  // 略窄于 1600 时先挤压双轨；到 1400 以下才砍掉左轨
+  const compact = useMedia('(max-width: 1599px)')
+  const singleRail = useMedia('(max-width: 1399px)')
+  const tooNarrow = useMedia('(max-width: 1149px)')
+  const [narrowSections, setNarrowSections] = useState(false)
+  const showSections = compact ? narrowSections : sectionsOpen
+  const toggleSections = () => {
+    if (compact) setNarrowSections((v) => !v)
+    else setSectionsOpen((v) => !v)
+  }
+  const closeSections = () => {
+    if (compact) setNarrowSections(false)
+    else setSectionsOpen(false)
+  }
+  const [tipClosed, setTipClosed] = useState(false)
   const [highlights, setHighlights] = useState<Highlight[]>([])
+  const [tables, setTables] = useState<TableBox[]>([])
+  const [tablesLoading, setTablesLoading] = useState(false)
+  const [tablesErr, setTablesErr] = useState('')
+  const [tableTool, setTableTool] = useState<{ table: TableBox; x: number; y: number } | null>(null)
+  const [tableView, setTableView] = useState<{ table: TableBox; blob: Blob; url: string; x: number; y: number } | null>(null)
+  const [tableCopied, setTableCopied] = useState(false)
+  const [tableBusy, setTableBusy] = useState(false)
   const [selected, setSelected] = useState<SelectedText | null>(null)
   const [hlMenu, setHlMenu] = useState<{ id: string; color: string; x: number; y: number } | null>(null)
   const [formulaBusy, setFormulaBusy] = useState(false)
@@ -73,6 +107,8 @@ export default function PaperView({ id }: { id: string }) {
   const [findQ, setFindQ] = useState('')
   const [findHits, setFindHits] = useState<{ blockId: string; page: number; snippet: string; count: number }[] | null>(null)
   const viewer = useRef<ViewerHandle | null>(null)
+  const paperIdRef = useRef(id)
+  paperIdRef.current = id
   const leftRail = useRef<HTMLDivElement>(null)
   const rightRail = useRef<HTMLDivElement>(null)
   const onReady = useCallback((h: ViewerHandle) => { viewer.current = h }, [])
@@ -86,15 +122,45 @@ export default function PaperView({ id }: { id: string }) {
     }).catch(() => {})
   }, [id])
 
+  const loadTables = useCallback(() => {
+    const reqId = id
+    setTablesLoading(true); setTablesErr('')
+    api.tables(reqId).then((d) => {
+      if (paperIdRef.current !== reqId) return   // 已切到别的论文，丢弃旧响应
+      setTables(d.tables || [])
+      setPaper((p) => p ? {
+        ...p,
+        structure: { ...p.structure, tables: d.tables, tables_version: d.version },
+      } : p)
+    }).catch((e: any) => {
+      if (paperIdRef.current === reqId) setTablesErr(String(e?.message || e))
+    }).finally(() => {
+      if (paperIdRef.current === reqId) setTablesLoading(false)
+    })
+  }, [id])
+
   useEffect(() => {
     setPaper(null); setErr(''); setCards([]); setTops({})
     setPlan(null); setShowPlan(false); setRecs(null); setSearchRes(null); setSteps([])
     setRecNote('')
     setDismissedTerms([])
     setHighlights([]); setSelected(null); setHlMenu(null)
+    setTables([]); setTablesLoading(false); setTablesErr(''); setTableTool(null); setTableView(null)
+    setTableBusy(false); setTableCopied(false)
     setFormulaBusy(false); setFormulaStep(''); setFormulaErr(''); setFormulaResult(null); setFormulaCopied('')
     setFindOpen(false); setFindHits(null); setFindQ('')
-    api.get(id).then(setPaper).catch((e) => setErr(String(e?.message || e)))
+    api.get(id).then((p) => {
+      if (paperIdRef.current !== id) return
+      setPaper(p)
+      const st = p.structure
+      if (Array.isArray(st.tables) && st.tables_version === TABLES_VERSION) {
+        setTables(st.tables)
+      } else {
+        loadTables()          // 老论文：后台懒补，不阻塞阅读
+      }
+    }).catch((e) => {
+      if (paperIdRef.current === id) setErr(String(e?.message || e))
+    })
     api.cards(id).then(setCards).catch(() => {})
     api.highlights(id).then(setHighlights).catch(() => {})
     api.profile(id).then((d) => {
@@ -104,24 +170,44 @@ export default function PaperView({ id }: { id: string }) {
       if (d.meta?.plan) setPlan(d.meta.plan)
       if (!d.meta?.domain) setProfile(true)   // 未做过摸底 → 上传后立即弹问卷
     }).catch(() => {})
-  }, [id])
+  }, [id, loadTables])
+
+  // tableView 换图/关闭时释放上一张图的 object URL
+  useEffect(() => () => { if (tableView) URL.revokeObjectURL(tableView.url) }, [tableView])
 
   useEffect(() => {
     try { localStorage.setItem('pc.sectionsOpen', sectionsOpen ? '1' : '0') } catch { /* ignore */ }
   }, [sectionsOpen])
 
-  // 点空白处收起标亮调色板 / 高亮操作菜单 / 公式弹窗
+  // 回到宽屏后重置窄屏抽屉状态，避免下次变窄时自动弹开
   useEffect(() => {
-    if (!selected && !hlMenu && !formulaResult) return
+    if (!compact) setNarrowSections(false)
+  }, [compact])
+
+  // 点空白处收起标亮调色板 / 高亮菜单 / 公式弹窗 / 表格工具条与图片
+  useEffect(() => {
+    if (!selected && !hlMenu && !formulaResult && !tableTool && !tableView) return
     const down = (e: MouseEvent) => {
       const t = e.target as HTMLElement
-      if (t.closest('.sel-palette') || t.closest('.hl-menu') || t.closest('.formula-pop')) return
+      if (t.closest('.sel-palette') || t.closest('.hl-menu') || t.closest('.formula-pop')
+        || t.closest('.toolbar-pop') || t.closest('.table-pop')) return
       setSelected(null); setHlMenu(null); setFormulaResult(null)
+      setTableTool(null); setTableView(null)
       viewer.current?.clearSelection()
     }
     addEventListener('mousedown', down)
     return () => removeEventListener('mousedown', down)
-  }, [selected, hlMenu, formulaResult])
+  }, [selected, hlMenu, formulaResult, tableTool, tableView])
+
+  useEffect(() => {
+    if (!tableTool && !tableView) return
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setTableTool(null); setTableView(null)
+    }
+    addEventListener('keydown', esc)
+    return () => removeEventListener('keydown', esc)
+  }, [tableTool, tableView])
 
   const analyze = async () => {
     setBusy(true); setErr('')
@@ -352,6 +438,7 @@ export default function PaperView({ id }: { id: string }) {
       const r = await api.chat(id, {
         block_ids: card.data.block_ids ?? [card.block_id].filter(Boolean),
         history: next, question,
+        table_id: card.data.table_id || undefined,
       })
       if (r.steps?.length) {
         setSteps((s) => [...s, ...r.steps!.map((st) => ({ blockId: anchor, text: st.text }))])
@@ -370,7 +457,7 @@ export default function PaperView({ id }: { id: string }) {
     if (!viewer.current || !r) return
     let best: Block | null = null; let bestD = 1e9
     for (const b of blocks) {
-      if (b.type === 'figure' || sideOf(b.id) !== side) continue
+      if (b.type === 'figure' || (!singleRail && sideOf(b.id) !== side)) continue
       const t = viewer.current.blockTop(b.page, b.y0, r)
       if (t == null) continue
       const d = Math.abs(t - top)
@@ -402,6 +489,62 @@ export default function PaperView({ id }: { id: string }) {
     setTool(null)
     await addCard('note', blockId, { text: '' })
   }
+
+  // ---------- 表格 ----------
+  const openTableTool = (table: TableBox, x: number, y: number) => {
+    setTool(null)
+    setTableTool({ table, x, y })
+  }
+
+  const showTable = async (table: TableBox, x: number, y: number) => {
+    if (tableBusy) return
+    setTableBusy(true)
+    try {
+      const blob = await viewer.current?.cropTable(table.page, table, 4)
+      if (!blob) throw new Error('截图失败')
+      const url = URL.createObjectURL(blob)
+      setTableView({ table, blob, url, x, y })
+      setTableTool(null)
+    } catch (e: any) { setErr(`查看表格失败：${e?.message || e}`) }
+    finally { setTableBusy(false) }
+  }
+
+  const copyTable = async (table: TableBox) => {
+    if (tableBusy) return
+    setTableBusy(true)
+    try {
+      const blob = tableView?.table.id === table.id && tableView.blob
+        ? tableView.blob
+        : await viewer.current?.cropTable(table.page, table, 4)
+      if (!blob) throw new Error('截图失败')
+      await copyImage(blob)
+      setTableCopied(true)
+      window.setTimeout(() => setTableCopied(false), 1600)
+    } catch (e: any) { setErr(`复制表格失败：${e?.message || e}`) }
+    finally { setTableBusy(false) }
+  }
+
+  const addTableChat = async (table: TableBox) => {
+    // 锚在表题块；没有表题时退到最近的正文段（整页旋转表可能同一页一个块都没有）
+    const byPage = blocks.filter((b) => b.type === 'para' || b.type === 'heading')
+    const near = (list: Block[]) => list
+      .slice()
+      .sort((a, b) => Math.abs(a.page - table.page) - Math.abs(b.page - table.page)
+        || Math.abs(a.y0 - table.y0) - Math.abs(b.y0 - table.y0))[0]?.id
+    const anchor = (table.caption_block_id && blockMap[table.caption_block_id])
+      ? table.caption_block_id
+      : (near(byPage.filter((b) => !b.table_id)) || near(byPage))
+    if (!anchor) { setErr('找不到表格在正文里的锚点'); return }
+    setTableTool(null)
+    await addCard('chat', anchor, {
+      block_ids: [anchor],
+      table_id: table.id,
+      table_caption: table.caption || '',
+      messages: [],
+    })
+  }
+
+  const closeTableView = () => setTableView(null)
 
   // ---------- 公式识别 ----------
   const runFormula = async (blob: Blob, x: number, y: number) => {
@@ -595,10 +738,13 @@ export default function PaperView({ id }: { id: string }) {
   const jump = (p?: number) => { if (p) viewer.current?.scrollToPage(p) }
 
   const termSide = (t: { refs: string[] }) => sideOf(t.refs.find((r) => blockMap[r]))
-  const leftTerms = visibleTerms.filter((t) => termSide(t) === 'left')
-  const rightTerms = visibleTerms.filter((t) => termSide(t) !== 'left')
-  const leftCards = cards.filter((c) => c.type !== 'term' && sideOf(c.block_id) === 'left')
-  const rightCards = cards.filter((c) => c.type !== 'term' && sideOf(c.block_id) !== 'left')
+  // 窄屏只保留右轨：所有卡片和术语统一进右轨，论文拿走左轨让出的宽度
+  const leftTerms = singleRail ? [] : visibleTerms.filter((t) => termSide(t) === 'left')
+  const rightTerms = singleRail ? visibleTerms : visibleTerms.filter((t) => termSide(t) !== 'left')
+  const leftCards = singleRail ? [] : cards.filter((c) => c.type !== 'term' && sideOf(c.block_id) === 'left')
+  const rightCards = singleRail
+    ? cards.filter((c) => c.type !== 'term')
+    : cards.filter((c) => c.type !== 'term' && sideOf(c.block_id) !== 'left')
 
   const renderTerm = (t: (typeof visibleTerms)[number]) => (
     <TermItem key={t.term} term={t.term} zh={t.zh}
@@ -614,7 +760,6 @@ export default function PaperView({ id }: { id: string }) {
 
   const renderCard = (c: Card, side: 'left' | 'right') => (
     <CardItem key={c.id} card={c} top={displayTops[c.id] ?? tops[c.id] ?? c.top}
-      maxWidth={side === 'left' ? 300 : 640}
       active={activeId === c.id}
       onActivate={() => setActiveId(c.id)}
       onTop={(t) => setTops((ts) => ({ ...ts, [c.id]: t }))}
@@ -622,11 +767,6 @@ export default function PaperView({ id }: { id: string }) {
       onDelete={() => { api.delCard(c.id); setCards((cs) => cs.filter((x) => x.id !== c.id)) }}
       onAsk={(q) => askChat(c, q)}
       onJump={jump}
-      onResize={(w) => {
-        const data = { ...c.data, width: w }
-        setCards((cs) => cs.map((x) => x.id === c.id ? { ...x, data } : x))
-      }}
-      onResizeEnd={(w) => api.patchCard(c.id, { data: { ...c.data, width: w } })}
       onPatch={(data) => {
         setCards((cs) => cs.map((x) => x.id === c.id ? { ...x, data } : x))
         api.patchCard(c.id, { data })
@@ -638,8 +778,14 @@ export default function PaperView({ id }: { id: string }) {
       <div className="topbar">
         <button className="btn small" onClick={() => (location.hash = '')}>←</button>
         <div className="title">{paper.title || paper.filename}</div>
-        <button className={`btn small${sectionsOpen ? ' primary' : ''}`} onClick={() => setSectionsOpen((v) => !v)}
-          title={sectionsOpen ? '收起章节概要侧边栏' : '展开章节概要侧边栏'}>☰ 章节</button>
+        {tablesLoading && <span className="table-chip">▦ 正在识别表格…</span>}
+        {tablesErr && (
+          <span className="table-chip err" title={tablesErr}>
+            表格识别失败 <button type="button" className="table-retry" onClick={loadTables}>重试</button>
+          </span>
+        )}
+        <button className={`btn small${showSections ? ' primary' : ''}`} onClick={toggleSections}
+          title={showSections ? '收起章节概要侧边栏' : '展开章节概要侧边栏'}>☰ 章节</button>
         <button className="btn small" onClick={() => setFindOpen(true)} title="在当前论文全文中检索">🔍 全文检索</button>
         <button className={`btn small${collected ? ' primary' : ''}`} onClick={toggleCollect}
           title={collected ? '取消收藏' : '加入文献库（参与推荐与综述）'}>
@@ -724,10 +870,10 @@ export default function PaperView({ id }: { id: string }) {
             ))}
           </div>
         </section>
-        <aside className={`sections-panel${sectionsOpen ? ' open' : ''}`}>
+        <aside className={`sections-panel${showSections ? ' open' : ''}`}>
           <div className="sp-head">
             <h3>章节导航 · 概要</h3>
-            <button className="x" title="收起侧边栏" onClick={() => setSectionsOpen(false)}>«</button>
+            <button className="x" title="收起侧边栏" onClick={closeSections}>«</button>
           </div>
           <div className="nav">
             {structure.sections.filter((s) => !s.is_references).map((s) => {
@@ -743,10 +889,12 @@ export default function PaperView({ id }: { id: string }) {
           </div>
         </aside>
         <div className="reader">
-          <aside className="rail left" ref={leftRail}>
-            {leftTerms.map(renderTerm)}
-            {leftCards.map((c) => renderCard(c, 'left'))}
-          </aside>
+          {!singleRail && (
+            <aside className="rail left" ref={leftRail}>
+              {leftTerms.map(renderTerm)}
+              {leftCards.map((c) => renderCard(c, 'left'))}
+            </aside>
+          )}
           <PdfViewer url={`/api/papers/${id}/pdf`} blocks={blocks} onReady={onReady}
             onLayout={recompute}
             onBlockClick={(blockId, x, y) => setTool({ blockId, x, y })}
@@ -754,7 +902,9 @@ export default function PaperView({ id }: { id: string }) {
             onSelectText={setSelected}
             onFormulaCrop={formulaCrop}
             formulaRegions={formulaRegions}
-            onHighlightClick={(h, x, y) => setHlMenu({ id: h.id, color: h.color, x, y })} />
+            onHighlightClick={(h, x, y) => setHlMenu({ id: h.id, color: h.color, x, y })}
+            tables={tables}
+            onTableClick={openTableTool} />
           <aside className="rail right" ref={rightRail}>
             {steps.map((s, i) => (
               <div key={i} className="agent-step">🔍 {s.text}</div>
@@ -771,6 +921,42 @@ export default function PaperView({ id }: { id: string }) {
           <button onClick={() => addChatGlobal(tool.blockId)} title="卡片仍锚在这段旁，但回答基于全文导读与目录，不局限于本段">🌐 问全文</button>
           <button onClick={() => addChat(tool.blockId, '用通俗的话讲讲这段在说什么')}> 通俗讲解</button>
           <button onClick={() => addNote(tool.blockId)}>📝 记笔记</button>
+        </div>
+      )}
+      {tableTool && (
+        <div className="toolbar-pop" style={{
+          left: Math.max(8, Math.min(tableTool.x + 8, innerWidth - 230)),
+          top: Math.max(8, Math.min(tableTool.y + 8, innerHeight - 60)),
+        }}>
+          <button disabled={tableBusy} onClick={() => showTable(tableTool.table, tableTool.x, tableTool.y)}>
+            {tableBusy ? '加载中…' : '▦ 查看表格'}</button>
+          <button disabled={tableBusy} onClick={() => copyTable(tableTool.table)}>
+            📋 {tableBusy ? '处理中…' : tableCopied ? '已复制' : '复制图片'}</button>
+          <button disabled={tableTool.table.quality !== 'ok'}
+            title={tableTool.table.quality === 'ok' ? '基于这张表的单元格文本提问' : '该表为旋转/乱码表，暂不能按文本提问'}
+            onClick={() => addTableChat(tableTool.table)}>💬 问这张表</button>
+        </div>
+      )}
+      {tableView && (
+        <div className="table-pop" style={{
+          left: Math.max(10, Math.min(tableView.x + 8, innerWidth - 480)),
+          top: Math.max(10, Math.min(tableView.y + 10, innerHeight - 520)),
+        }}>
+          <div className="th">
+            <span className="tt">▦ {tableView.table.caption || `第${tableView.table.page}页表格`}</span>
+            <button className="x" title="关闭" onClick={closeTableView}>✕</button>
+          </div>
+          <div className="tb"><img src={tableView.url} alt="表格" /></div>
+          <div className="ta">
+            <button className="btn small" disabled={tableBusy} onClick={() => copyTable(tableView.table)}>
+              {tableBusy ? '处理中…' : '复制图片'}</button>
+            <button className="btn small" disabled={tableView.table.quality !== 'ok'}
+              onClick={() => addTableChat(tableView.table)}>问这张表</button>
+            {tableCopied && <span className="ok">已复制</span>}
+          </div>
+          {tableView.table.quality !== 'ok' && (
+            <div className="thint">该表为旋转/乱码表，暂不能按文本提问，可复制图片</div>
+          )}
         </div>
       )}
       {selected && (
@@ -869,6 +1055,12 @@ export default function PaperView({ id }: { id: string }) {
         <div className="quiz-prompt" onClick={() => setQuiz(true)}>
           🎓 已读完全篇，来做 3 道自测检验掌握程度吧 →
           <button className="x" onClick={(e) => { e.stopPropagation(); setAtEnd(false) }}>稍后</button>
+        </div>
+      )}
+      {tooNarrow && !tipClosed && (
+        <div className="narrow-tip">
+          <span>窗口偏窄，论文会偏小。建议把窗口拉宽到 1366 以上。</span>
+          <button className="x" title="关闭提示" onClick={() => setTipClosed(true)}>✕</button>
         </div>
       )}
       {settings && <SettingsModal onClose={() => setSettings(false)} />}

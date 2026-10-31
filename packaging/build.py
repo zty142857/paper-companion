@@ -252,6 +252,12 @@ def build_frontend(skip: bool) -> None:
 def build_backend() -> str:
     sep = ";" if os.name == "nt" else ":"
     add_data = f"{os.path.join(FRONTEND, 'dist')}{sep}frontend_dist"
+    # 模型能力目录（models.dev 快照）：模型列表 / 思考强度的离线数据源，必须随包分发
+    catalog = os.path.join(BACKEND, "app", "model_catalog.json")
+    if not os.path.isfile(catalog):
+        raise SystemExit("缺少 backend/app/model_catalog.json，先运行 "
+                         "python packaging/build_model_catalog.py 生成模型目录快照")
+    add_catalog = f"{catalog}{sep}app"
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--onedir",
@@ -261,6 +267,7 @@ def build_backend() -> str:
         "--specpath", PY_WORK,
         "--paths", BACKEND,
         "--add-data", add_data,
+        "--add-data", add_catalog,
         "--collect-all", "pymupdf",
         # 公式/表格区域检测用 PyMuPDF 2.0 的版面模型，模型文件在 pymupdf/layout/resources 下，
         # 推理走 onnxruntime（延时 import，PyInstaller 扫不到，必须显式收集）。

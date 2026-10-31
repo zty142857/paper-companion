@@ -26,3 +26,10 @@ PROJECT.md
 
 # 公式 OCR 模型（本地缓存，约 77MB，不入库）
 frontend/public/models/
+
+# 本地阅读/收藏的论文 PDF，属于个人数据，不入库
+/*.pdf
+
+# 开发过程产物：本地改动备份、布局对比截图
+paper-companion-backup-*/
+layout-screenshots/

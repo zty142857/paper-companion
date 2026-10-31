@@ -1,6 +1,8 @@
 export interface Block {
   id: string; page: number; col: number; type: 'para' | 'heading' | 'figure' | 'formula'
   y0: number; y1: number; x0: number; x1: number; size: number; text: string; section_id: string | null
+  /** 落在表格框内的正文块（摘要会排除；卡片锚点仍有效） */
+  table_id?: string
 }
 export interface Section {
   id: string; title: string; level: number; page: number; heading_block_id: string
@@ -17,10 +19,24 @@ export interface FormulaBox {
   page: number; x0: number; y0: number; x1: number; y1: number
   number?: string | null; src?: string
 }
+export interface TableBox {
+  id: string; page: number
+  x0: number; y0: number; x1: number; y1: number
+  caption?: string; caption_block_id?: string
+  /** 只在 quality === 'ok' 时存在；旋转/乱码表为图片模式 */
+  rows?: string[][]
+  quality: 'ok' | 'image_only'
+  reason?: string
+  source?: string
+}
+/** 表格抽取规则版本：老论文没有这个版本号时，前端打开会调 /tables 懒补 */
+export const TABLES_VERSION = 2
 export interface Structure {
   title: string; pages: number; blocks: Block[]; sections: Section[]
   /** 后端版面模型给出的整条公式框（1.0 解析器新增；老论文没有这个字段） */
   formulas?: FormulaBox[]
+  tables?: TableBox[]
+  tables_version?: number
 }
 export interface Paper {
   id: string; title: string; filename: string; pages: number
@@ -38,9 +54,39 @@ export interface Highlight {
 export interface NewHighlight {
   page: number; color: string; text: string; rects: number[][]
 }
-export interface LlmSettings {
-  base_url: string; api_key: string; model: string; effort: string; has_key: boolean
+export interface ReasoningOption { type: 'toggle' | 'effort' | 'budget_tokens'; values?: string[] }
+export interface ModelInfo {
+  known: boolean; name: string; reasoning: boolean
+  reasoning_options: ReasoningOption[]
+  limit: { context?: number; output?: number }
+  cost?: Record<string, number>
 }
+export interface ProviderModelsMeta {
+  enabled: string[]; available: number; fetched_at: number | null; source: string
+}
+export interface Provider {
+  id: string; name: string; base_url: string; api_key: string; has_key: boolean
+  headers: Record<string, string>; catalog_id: string | null; catalog_name?: string | null
+  models: ProviderModelsMeta; in_use: string[]
+}
+export interface ProviderPreset {
+  id: string; name: string; api: string; model_count: number; local: boolean
+}
+export interface RouteConfig {
+  provider_id: string; provider_name: string; model: string; effort: string; configured?: boolean
+}
+export interface Routes { default: RouteConfig; translate: RouteConfig }
+export interface ModelRow {
+  id: string; name: string; known: boolean; reasoning_options: ReasoningOption[]; context?: number
+}
+export interface ProviderModelList {
+  models: ModelRow[]; enabled: string[]; source: string; error: string; fetched_at: number | null
+}
+export interface ProviderTestResult {
+  ok: boolean; model?: string; provider?: string; latency_ms?: number
+  reply?: string; error?: string; reasoning?: Record<string, unknown>
+}
+
 export interface ProfilePrior {
   domain: string; familiarity: string; known_terms: string[]; updated_at: number
 }
@@ -127,11 +173,32 @@ export const api = {
     fetch(`/api/papers/${pid}/copy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ folder_id }) }).then(j),
   analyze: (id: string): Promise<Analysis> =>
     fetch(`/api/papers/${id}/analyze`, { method: 'POST' }).then(j),
-  settings: (): Promise<LlmSettings> => fetch('/api/settings').then(j),
-  saveSettings: (s: Partial<LlmSettings>): Promise<LlmSettings> =>
-    fetch('/api/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s) }).then(j),
-  testSettings: (s: Partial<LlmSettings>): Promise<{ ok: boolean; model?: string; latency_ms?: number; reply?: string; error?: string }> =>
-    fetch('/api/settings/test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s) }).then(j),
+  providers: (): Promise<Provider[]> => fetch('/api/providers').then(j),
+  providerPresets: (): Promise<ProviderPreset[]> => fetch('/api/provider-presets').then(j),
+  addProvider: (b: { name?: string; base_url?: string; api_key?: string; catalog_id?: string | null }): Promise<Provider> =>
+    fetch('/api/providers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then(j),
+  updateProvider: (id: string, b: { name?: string; base_url?: string; api_key?: string; headers?: Record<string, string>; catalog_id?: string | null; clear_key?: boolean }): Promise<Provider> =>
+    fetch(`/api/providers/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then(j),
+  deleteProvider: (id: string): Promise<{ ok: boolean }> =>
+    fetch(`/api/providers/${id}`, { method: 'DELETE' }).then(j),
+  testProvider: (id: string, b: { base_url?: string; api_key?: string; model?: string; effort?: string; purpose?: string }): Promise<ProviderTestResult> =>
+    fetch(`/api/providers/${id}/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then(j),
+  syncProviderModels: (id: string): Promise<ProviderModelList> =>
+    fetch(`/api/providers/${id}/models/sync`, { method: 'POST' }).then(j),
+  providerModels: (id: string): Promise<ProviderModelList> =>
+    fetch(`/api/providers/${id}/models`).then(j),
+  saveProviderModels: (id: string, enabled: string[]): Promise<{ ok: boolean; enabled: string[] }> =>
+    fetch(`/api/providers/${id}/models`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(j),
+  modelInfo: (provider_id: string, model: string): Promise<ModelInfo> =>
+    fetch(`/api/model-info?provider_id=${encodeURIComponent(provider_id)}&model=${encodeURIComponent(model)}`).then(j),
+  routes: (): Promise<Routes> => fetch('/api/routes').then(j),
+  saveRoutes: (r: Partial<Routes>): Promise<Routes> =>
+    fetch('/api/routes', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(r) }).then(j),
+  probeEfforts: (provider_id: string, model: string, levels: string[]):
+    Promise<{ ok: boolean; results: { level: string; ok: boolean; latency_ms: number; error?: string }[] }> =>
+    fetch('/api/settings/probe-efforts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider_id, model, levels }) }).then(j),
+  refreshCatalog: (): Promise<{ ok: boolean; providers: number; models: number; bytes: number }> =>
+    fetch('/api/catalog/refresh', { method: 'POST' }).then(j),
   clearData: (): Promise<{ ok: boolean; papers_removed: number }> =>
     fetch('/api/data/clear', { method: 'POST' }).then(j),
   cards: (pid: string): Promise<Card[]> => fetch(`/api/papers/${pid}/cards`).then(j),
@@ -140,12 +207,14 @@ export const api = {
   patchCard: (cid: string, f: object): Promise<any> =>
     fetch(`/api/cards/${cid}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(f) }).then(j),
   delCard: (cid: string): Promise<any> => fetch(`/api/cards/${cid}`, { method: 'DELETE' }).then(j),
+  tables: (pid: string): Promise<{ tables: TableBox[]; version: number }> =>
+    fetch(`/api/papers/${pid}/tables`).then(j),
   translate: (pid: string, block_id: string): Promise<{ translation: string; page: number }> =>
     fetch(`/api/papers/${pid}/translate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id }) }).then(j),
   explainTerm: (pid: string, body: { term: string; zh?: string; refs?: string[] }):
     Promise<{ term: string; zh: string; expl: string; refs: string[]; pages: number[] }> =>
     fetch(`/api/papers/${pid}/term`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
-  chat: (pid: string, body: { block_ids: string[]; history: object[]; question: string }):
+  chat: (pid: string, body: { block_ids: string[]; history: object[]; question: string; table_id?: string }):
     Promise<{ answer: string; refs: string[]; pages: number[]; steps?: ChatStep[] }> =>
     fetch(`/api/papers/${pid}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
   profile: (pid: string): Promise<ProfileResponse> => fetch(`/api/papers/${pid}/profile`).then(j),

@@ -52,15 +52,34 @@ def _mode() -> str:
 
 # ---------------- 版面模型 ----------------
 
-def _layout_boxes(page) -> list[tuple] | None:
+def page_layouts(doc) -> dict[int, list | None]:
+    """一次跑完版面模型，供公式与表格共用。
+
+    `get_layout()` 实测约 1.5s/页且不缓存；公式和表格各跑一遍会白白多花
+    20 秒以上。返回值 None 表示该页模型不可用（区别于“没有 block”的空列表）。
+    """
+    out: dict[int, list | None] = {}
+    for page in doc:
+        try:
+            if not page.get_text("text").strip():
+                continue
+            page.get_layout()
+            out[page.number] = page.layout_information or []
+        except Exception:
+            out[page.number] = None
+    return out
+
+
+def _layout_boxes(page, info=None, cached: bool = False) -> list[tuple] | None:
     """版面模型的 formula 框；模型不可用时返回 None（区别于"没有公式"的 []）。"""
-    if not hasattr(page, "get_layout"):
-        return None
-    try:
-        page.get_layout()
-    except Exception:
-        return None
-    info = getattr(page, "layout_information", None)
+    if not cached:
+        if not hasattr(page, "get_layout"):
+            return None
+        try:
+            page.get_layout()
+        except Exception:
+            return None
+        info = getattr(page, "layout_information", None)
     if info is None:
         return None
     return [tuple(float(v) for v in e[:4]) for e in info if str(e[4]) == "formula"]
@@ -596,11 +615,11 @@ def _number_uncovered(spans, kept) -> bool:
     return False
 
 
-def detect_page(page) -> tuple[str, list[tuple]]:
+def detect_page(page, info=None, cached: bool = False) -> tuple[str, list[tuple]]:
     """单页 → (来源, 原始框列表)。来源是 ``layout`` 或 ``heuristic``。"""
     mode = _mode()
     if mode != "off":
-        boxes = _layout_boxes(page)
+        boxes = _layout_boxes(page, info, cached)
         if boxes is not None:
             return "layout", boxes
         if mode == "on":
@@ -608,7 +627,8 @@ def detect_page(page) -> tuple[str, list[tuple]]:
     return "heuristic", heuristic_boxes(page)
 
 
-def extract_formulas(doc, max_pages: int | None = None) -> list[dict]:
+def extract_formulas(doc, max_pages: int | None = None,
+                     layouts: dict[int, list | None] | None = None) -> list[dict]:
     """整个文档 → ``structure["formulas"]`` 列表（按页、纵向排序）。"""
     out: list[dict] = []
     for page in doc:
@@ -621,7 +641,12 @@ def extract_formulas(doc, max_pages: int | None = None) -> list[dict]:
         except Exception:
             continue
         try:
-            src, boxes = detect_page(page)
+            if layouts is not None:
+                if page.number not in layouts:
+                    continue                    # 无文字层的页，公式不可能存在
+                src, boxes = detect_page(page, layouts[page.number], cached=True)
+            else:
+                src, boxes = detect_page(page)
         except Exception:
             continue
         if not boxes:

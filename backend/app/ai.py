@@ -29,8 +29,17 @@ def _context(structure: dict, block_ids: list[str]) -> str:
         return ""
     # 附带同节相邻块，补足上下文
     first = blocks[ids[0]]
-    same = [b for b in structure["blocks"] if b["section_id"] == first["section_id"] and b["type"] not in ("figure",)]
-    lo = min(next(i for i, b in enumerate(same) if b["id"] == ids[0]), len(same) - 1)
+    same = [b for b in structure["blocks"]
+            if b["section_id"] == first["section_id"]
+            and b["type"] not in ("figure",)
+            and not b.get("table_id")]
+    if not same:
+        return ""
+    try:
+        lo = next(i for i, b in enumerate(same) if b["id"] == ids[0])
+    except StopIteration:          # 锚点本身落在表内（老卡片）→ 从本节开头取
+        lo = 0
+    lo = min(lo, len(same) - 1)
     window = same[max(0, lo - 1): lo + 6]
     picked = [b for b in window if b["id"] in ids] + [b for b in window if b["id"] not in ids]
     lines, used = [], 0
@@ -83,6 +92,131 @@ def _global_ctx(structure: dict, analysis: dict | None) -> str:
     return "\n\n".join(parts)
 
 
+TABLE_CTX_CAP = 6000
+TABLE_ONE_CAP = 3000
+TABLE_CITE_RE = re.compile(r"\[(t\d+)\]")
+_TABLE_Q_RE = re.compile(r"(表格|表\s*[0-9IVX]|table|tab\.)", re.I)
+_TABLE_TOPIC_RE = re.compile(r"(数据|参数|指标|结果|数值|实验|误差|精度|对比|性能|超参|hyperparam)", re.I)
+
+
+def _bid_num(b: dict) -> int:
+    m = re.match(r"b(\d+)$", str(b.get("id") or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _table_head(t: dict) -> str:
+    cap = (t.get("caption") or "").strip() or f"第{t.get('page')}页表格"
+    return f"【表格 {t.get('id')}｜第{t.get('page')}页｜{cap}】"
+
+
+def _table_text(t: dict, cap: int = TABLE_ONE_CAP) -> str:
+    rows = t.get("rows") or []
+    lines, used = [], 0
+    for r in rows:
+        line = " | ".join(str(c) for c in r)
+        if used + len(line) + 1 > cap:
+            lines.append("…（表格较长，已截断）")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
+def _table_ctx(structure: dict, table: dict) -> str:
+    """问某张表：表题 + 表格文本 + 表前后各 2 个非表格段落。"""
+    blocks = sorted(structure.get("blocks") or [], key=_bid_num)
+    idx = {b["id"]: i for i, b in enumerate(blocks)}
+    tagged = [i for i, b in enumerate(blocks) if b.get("table_id") == table.get("id")]
+    cap_id = table.get("caption_block_id") or ""
+    cap_i = idx.get(cap_id)
+    if tagged:
+        center, start = tagged[0], tagged[-1] + 1
+    elif cap_i is not None:
+        center, start = cap_i, cap_i + 1
+    elif blocks:
+        # 整页旋转表（394f p4）解析器没有任何块：退到最接近该页的正文位置
+        tpage = int(table.get("page") or 1)
+        ty = float(table.get("y0") or 0)
+        center = min(range(len(blocks)), key=lambda i: (
+            abs(int(blocks[i].get("page") or 1) - tpage),
+            abs(float(blocks[i].get("y0") or 0) - ty)))
+        start = center + 1
+    else:
+        center, start = 0, 0
+
+    def usable(b: dict) -> bool:
+        return (not b.get("table_id") and b.get("type") not in ("figure", "formula")
+                and bool((b.get("text") or "").strip()))
+
+    pre = [b for b in blocks[max(0, center - 5):center] if usable(b)][-2:]
+    post = [b for b in blocks[start:start + 8] if usable(b)][:2]
+    sec = {s["id"]: s["title"] for s in structure.get("sections") or []}
+
+    parts = []
+    if cap_i is not None:
+        cb = blocks[cap_i]
+        parts.append(f"[{cb['id']}|第{cb['page']}页|{sec.get(cb.get('section_id'), '')}] "
+                     f"{(cb.get('text') or '')[:600]}")
+    parts.append(_table_head(table))
+    if table.get("quality") == "ok":
+        body = _table_text(table)
+        parts.append(body or "（表格内容为空，可参考表题与上下文）")
+    else:
+        parts.append("（该表为旋转/乱码/图片表，无法按文本读取；不要编造表内数值）")
+    for b in pre + post:
+        if cap_id and b["id"] == cap_id:
+            continue
+        parts.append(f"[{b['id']}|第{b['page']}页|{sec.get(b.get('section_id'), '')}] "
+                     f"{(b.get('text') or '')[:600]}")
+    return "\n".join(parts)
+
+
+def _table_index(structure: dict) -> str:
+    rows = []
+    for t in (structure.get("tables") or [])[:40]:
+        cap = (t.get("caption") or "").strip() or "（无表题）"
+        rows.append(f"- {t.get('id')}：第{t.get('page')}页 {cap}")
+    if not rows:
+        return ""
+    return ("\n\n【表格目录（引用表格时用「表 tN」，不要写成块ID）】\n" + "\n".join(rows))
+
+
+def _tables_ctx(structure: dict, question: str) -> str:
+    """全篇问答命中表格关键词时附带表文本；点名 Table N 时优先那几张。"""
+    all_tables = structure.get("tables") or []
+    ok_tables = [t for t in all_tables if t.get("quality") == "ok" and t.get("rows")]
+    m = re.search(r"(?:table|表)\s*([0-9]+)", question, re.I)
+    picked: list[dict] = []
+    if m:
+        n = int(m.group(1))
+        # 先按表题里的编号找（Table 3），再按文档顺序找第 n 张
+        by_cap = [t for t in all_tables
+                  if re.search(rf"(?:table|表)\s*{n}\b", t.get("caption") or "", re.I)]
+        target = by_cap[:1] or ([all_tables[n - 1]] if 1 <= n <= len(all_tables) else [])
+        if target and target[0].get("quality") != "ok":
+            t = target[0]
+            return ("\n\n" + _table_head(t)
+                    + "\n（该表为旋转/乱码/图片表，无法按文本读取；不要编造表内数值）")
+        picked = [t for t in target if t in ok_tables]
+    if not picked:
+        picked = [t for t in ok_tables if len(t.get("rows") or []) <= 10]
+    parts, used = [], 0
+    for t in picked:
+        body = _table_text(t)
+        if not body:
+            continue
+        line = _table_head(t) + "\n" + body
+        if used + len(line) > TABLE_CTX_CAP:
+            break
+        parts.append(line)
+        used += len(line)
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+def _looks_table_question(q: str) -> bool:
+    return bool(_TABLE_Q_RE.search(q or "") or _TABLE_TOPIC_RE.search(q or ""))
+
+
 _TERM_DEPTH_HINT = {
     "terminology_deep": "读者基础较薄，请解释得**非常详细**：先给通俗比喻，再说明它在本文中的具体角色，必要时补充相关背景概念。",
     "normal": "读者有一定基础，请给出 2-4 句白话解释，说明它在本论文语境下的含义与作用。",
@@ -124,9 +258,11 @@ def _neighbors(structure: dict, block_id: str):
     if i is None:
         return None, None
     prev = next((order[j] for j in range(i - 1, -1, -1)
-                 if order[j]["type"] not in ("figure", "formula") and order[j]["text"].strip()), None)
+                 if order[j]["type"] not in ("figure", "formula")
+                 and not order[j].get("table_id") and order[j]["text"].strip()), None)
     nxt = next((order[j] for j in range(i + 1, len(order))
-                if order[j]["type"] not in ("figure", "formula") and order[j]["text"].strip()), None)
+                if order[j]["type"] not in ("figure", "formula")
+                and not order[j].get("table_id") and order[j]["text"].strip()), None)
     return prev, nxt
 
 
@@ -153,17 +289,25 @@ def translate(structure: dict, block_id: str) -> dict:
 {ctx_prev}原文片段：
 {b['text']}
 {ctx_next}"""
-    data = llm.chat_json(prompt, "你是学术翻译。")
+    data = llm.chat_json(prompt, "你是学术翻译。", purpose="translate")
     return {"translation": data.get("translation") or data.get("error", ""),
             "block_id": block_id, "page": b["page"]}
 
 
 def chat(structure: dict, block_ids: list[str], history: list[dict], question: str,
          allow_search: bool = True, familiarity: str | None = None,
-         analysis: dict | None = None) -> dict:
-    ctx = _context(structure, block_ids)
-    if not ctx:
-        ctx = _global_ctx(structure, analysis)   # 全篇提问：喂整体画像而非空串
+         analysis: dict | None = None, table_id: str = "") -> dict:
+    table = next((t for t in (structure.get("tables") or [])
+                  if t.get("id") == table_id), None) if table_id else None
+    if table:
+        ctx = _table_ctx(structure, table)       # 问这张表：表题 + 表格 + 前后段落
+    else:
+        ctx = _context(structure, block_ids)
+        if not ctx:
+            ctx = _global_ctx(structure, analysis)   # 全篇提问：喂整体画像而非空串
+            ctx += _table_index(structure)           # 表题目录始终给，成本很低
+            if _looks_table_question(question):
+                ctx += _tables_ctx(structure, question)
     ctx += _toc_ctx(structure)                   # 无论有无选段，都给全文目录
     paper_title = structure.get("title", "")
     steps: list[dict] = []
@@ -202,7 +346,9 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
 2. 上下文里找不到依据时：若属于通用背景知识可以补充，但必须先用一句「论文中未提及，以下为背景知识：」说明；
    若你也无法确定，直接说「不确定/原文未提及」，严禁编造。
 3. 若提供了「外部检索结果」，可据此补充，但须注明「据外部检索」并给出标题/链接。
-4. 用中文回答，简洁分点。只输出 JSON。"""
+4. 用中文回答，简洁分点。只输出 JSON。
+5. 若「论文上下文」包含【表格 tN】，表内数值/参数必须来自该表；表中没有的不要推断。
+   表格本身用「表 tN（第N页）」引用，不要写成 [tN]；块ID仍只用 [b数字]。"""
     if familiarity:
         sys += "\n说话风格：" + llm.tone_hint(familiarity)
     extra = f"\n\n外部检索结果：\n{search_ctx}" if search_ctx else ""
@@ -218,6 +364,7 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
     valid = {b["id"] for b in structure["blocks"]}
     refs = [r for r in data.get("refs", []) if r in valid]
     answer = data.get("answer", "（生成失败，请重试）")
+    extra_pages: set[int] = set()
     # 模型在全篇问答里爱用 [s20]/[s18-s26] 引节号：展开为页码（可跳转），并从正文剔除噪声
     sec_pages = {s["id"]: s["page"] for s in structure["sections"]}
     chunks = SEC_CITE_RE.findall(answer)
@@ -230,9 +377,16 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
             for tok in re.findall(r"s\d+", SEC_RANGE_RE.sub("", c)):   # 零散 sN
                 if tok in sec_pages:
                     cited.add(tok)
-        extra_pages = {sec_pages[c] for c in cited}
+        extra_pages |= {sec_pages[c] for c in cited}
         answer = re.sub(r"\s{2,}", " ", SEC_CITE_RE.sub("", answer)).strip()
-        pages = sorted({b["page"] for b in structure["blocks"] if b["id"] in refs} | extra_pages)[:4]
-        return {"answer": answer, "refs": refs, "pages": pages, "steps": steps}
-    pages = sorted({b["page"] for b in structure["blocks"] if b["id"] in refs})[:4]
+    # 表格用 [tN] 引用时换成「表 tN（第N页）」，并把页码带进跳转列表
+    table_pages = {t["id"]: t["page"] for t in (structure.get("tables") or [])}
+    tchunks = TABLE_CITE_RE.findall(answer)
+    if tchunks:
+        extra_pages |= {table_pages[x] for x in tchunks if x in table_pages}
+        answer = TABLE_CITE_RE.sub(
+            lambda m: f"（表 {m.group(1)}，第{table_pages.get(m.group(1), '?')}页）", answer)
+    if table:
+        extra_pages.add(table["page"])
+    pages = sorted({b["page"] for b in structure["blocks"] if b["id"] in refs} | extra_pages)[:4]
     return {"answer": answer, "refs": refs, "pages": pages, "steps": steps}

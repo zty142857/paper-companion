@@ -15,8 +15,6 @@ interface Props {
   onJump: (page: number) => void
 }
 
-const WIDTH = 300
-
 /**
  * 术语元素，两种形态：
  * - 未点击过（无卡）：琥珀色小卡（chip），用于区分"尚未查看的术语"。
@@ -80,7 +78,7 @@ export default function TermItem({
 
   return (
     <div className={`card term${expanded ? ' active' : ''}`} data-id={card?.id || `term:${term}`} data-term={term}
-      style={{ top, width: card?.data.width ?? WIDTH }}>
+      style={{ top }}>
       <div className="ch" onPointerDown={down} onPointerMove={move} onPointerUp={up} onClick={clickHead}>
         <span className="ico">📚</span>
         <span className="ct">{term}{zh ? <span className="ct-zh">{zh}</span> : null}</span>

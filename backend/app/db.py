@@ -7,7 +7,13 @@ import uuid
 
 
 def _data_dir() -> str:
-    """数据目录：打包后放在可执行文件旁边（升级覆盖程序不丢数据），源码运行放在 backend/ 下。"""
+    """数据目录：打包后放在可执行文件旁边（升级覆盖程序不丢数据），源码运行放在 backend/ 下。
+
+    测试或多实例场景可用环境变量 PAPER_COMPANION_DATA_DIR 指到别处。
+    """
+    override = os.environ.get("PAPER_COMPANION_DATA_DIR")
+    if override:
+        return os.path.abspath(override)
     if getattr(sys, "frozen", False):
         return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "data")
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -67,6 +73,9 @@ def init():
         CREATE TABLE IF NOT EXISTS highlight(
           id TEXT PRIMARY KEY, paper_id TEXT, page INTEGER, color TEXT,
           text TEXT, rects TEXT, created_at REAL);
+        CREATE TABLE IF NOT EXISTS provider(
+          id TEXT PRIMARY KEY, name TEXT, base_url TEXT, api_key TEXT, headers TEXT,
+          catalog_id TEXT, models TEXT, created_at REAL);
         """)
         # 轻量迁移：旧库补列
         pcols = {r[1] for r in c.execute("PRAGMA table_info(paper)")}
@@ -110,6 +119,13 @@ def finish_paper(pid, title, pdf_path, structure):
                    "parsed", pid))
 
 
+def set_structure(pid, structure):
+    """只更新 structure（表格回填等），不动 title/status/analysis。"""
+    with conn() as c:
+        c.execute("UPDATE paper SET structure=? WHERE id=?",
+                  (json.dumps(structure, ensure_ascii=False), pid))
+
+
 def get_paper(pid) -> dict | None:
     with conn() as c:
         r = c.execute("SELECT * FROM paper WHERE id=?", (pid,)).fetchone()
@@ -147,6 +163,74 @@ def get_setting(k, default=None):
 def set_setting(k, v):
     with conn() as c:
         c.execute("INSERT OR REPLACE INTO setting VALUES(?,?)", (k, v))
+
+
+# ---------------- 模型提供商 ----------------
+
+def _provider_row(r) -> dict:
+    d = dict(r)
+    try:
+        d["headers"] = json.loads(d.get("headers") or "{}")
+    except ValueError:
+        d["headers"] = {}
+    try:
+        d["models"] = json.loads(d.get("models") or "{}")
+    except ValueError:
+        d["models"] = {}
+    if not isinstance(d["headers"], dict):
+        d["headers"] = {}
+    if not isinstance(d["models"], dict):
+        d["models"] = {}
+    return d
+
+
+def list_providers() -> list[dict]:
+    with conn() as c:
+        rows = c.execute("SELECT * FROM provider ORDER BY created_at").fetchall()
+    return [_provider_row(r) for r in rows]
+
+
+def get_provider(pid: str | None) -> dict | None:
+    if not pid:
+        return None
+    with conn() as c:
+        r = c.execute("SELECT * FROM provider WHERE id=?", (pid,)).fetchone()
+    return _provider_row(r) if r else None
+
+
+def add_provider(name: str, base_url: str, api_key: str = "", headers: dict | None = None,
+                 catalog_id: str | None = None) -> str:
+    pid = "p_" + uuid.uuid4().hex[:12]
+    with conn() as c:
+        c.execute("INSERT INTO provider VALUES(?,?,?,?,?,?,?,?)",
+                  (pid, name, base_url, api_key or "", json.dumps(headers or {}, ensure_ascii=False),
+                   catalog_id or None, "{}", time.time()))
+    return pid
+
+
+def update_provider(pid: str, **fields) -> bool:
+    """只更新传入的字段；headers / models 传 dict 会自动序列化。"""
+    allowed = {"name", "base_url", "api_key", "headers", "catalog_id", "models"}
+    pairs, vals = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k in ("headers", "models"):
+            v = json.dumps(v or {}, ensure_ascii=False)
+        pairs.append(f"{k}=?")
+        vals.append(v)
+    if not pairs:
+        return False
+    vals.append(pid)
+    with conn() as c:
+        cur = c.execute(f"UPDATE provider SET {', '.join(pairs)} WHERE id=?", vals)
+        return cur.rowcount > 0
+
+
+def delete_provider(pid: str) -> bool:
+    with conn() as c:
+        cur = c.execute("DELETE FROM provider WHERE id=?", (pid,))
+        return cur.rowcount > 0
 
 
 def add_card(paper_id, type_, block_id, top, data) -> str:
@@ -423,7 +507,7 @@ def set_collected(pid, val: bool):
 def clear_all_data(keep_llm_settings: bool = True) -> int:
     """一键清除：删除全部论文、卡片、档案、元数据与 PDF 文件。
 
-    keep_llm_settings=True 时保留模型配置（base_url/model/effort），仅清除 api_key。
+    keep_llm_settings=True 时保留模型配置（提供商 / 模型 / 思考强度），仅清除所有 api_key。
     返回清除的论文数。
     """
     n = len(list_papers())
@@ -435,6 +519,7 @@ def clear_all_data(keep_llm_settings: bool = True) -> int:
         c.execute("DELETE FROM paper")
         c.execute("DELETE FROM folder")
         c.execute("DELETE FROM setting WHERE k='llm_api_key'")
+        c.execute("UPDATE provider SET api_key=''")
         if not keep_llm_settings:
             c.execute("DELETE FROM setting")
     for f in os.listdir(PDF_DIR):

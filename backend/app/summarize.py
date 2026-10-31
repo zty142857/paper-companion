@@ -18,7 +18,10 @@ def build_digest(structure: dict) -> tuple[str, dict]:
     sec_title = {s["id"]: s["title"] for s in structure["sections"]}
     ref_sec = {s["id"] for s in structure["sections"] if s["is_references"]}
     cand = [b for b in structure["blocks"]
-            if b["type"] not in ("figure", "formula") and b["section_id"] not in ref_sec]
+            if b["type"] not in ("figure", "formula")
+            and not b.get("table_id")
+            and b["section_id"] not in ref_sec]
+    table_notes = _table_notes(structure, cand)
     groups: dict[str | None, list] = {}
     for b in cand:
         groups.setdefault(b["section_id"], []).append(b)   # dict 保序：按文档顺序
@@ -33,7 +36,8 @@ def build_digest(structure: dict) -> tuple[str, dict]:
     full = {sid: sum(len(line(b, PARA_CAP)) + 1 for b in bs) for sid, bs in groups.items()}
     total = sum(full.values())
     if total <= DIGEST_CHAR_BUDGET:
-        return "\n".join(line(b, PARA_CAP) for bs in groups.values() for b in bs), blocks
+        body = "\n".join(line(b, PARA_CAP) for bs in groups.values() for b in bs)
+        return ("\n".join([body, *table_notes]) if table_notes else body), blocks
 
     MIN = 260          # 每个节至少保留的字符（其首段），确保无节被整段丢弃
     pool = max(0, DIGEST_CHAR_BUDGET - MIN * len(groups))
@@ -54,7 +58,26 @@ def build_digest(structure: dict) -> tuple[str, dict]:
             if text_cap >= 40:
                 lines.append(line(b, text_cap))
             break
+    if table_notes:
+        lines.extend(table_notes)
     return "\n".join(lines), blocks
+
+
+def _table_notes(structure: dict, cand: list[dict]) -> list[str]:
+    """摘要里只补“表题/无表题占位”，不把单元格文本塞进导读。
+
+    表题块本身通常在 cand 里，已经在正文中；这里只补表题块缺失或没有表题的表，
+    避免同一张表在摘要里出现两次。
+    """
+    cand_ids = {b["id"] for b in cand}
+    out = []
+    for t in (structure.get("tables") or [])[:40]:
+        cid = t.get("caption_block_id") or ""
+        if cid and cid in cand_ids:
+            continue
+        cap = (t.get("caption") or "").strip() or "（无表题）"
+        out.append(f"[表|第{t.get('page')}页] {cap}")
+    return out
 
 
 def analyze(structure: dict, known_terms: list[str] | None = None, plan: dict | None = None,
