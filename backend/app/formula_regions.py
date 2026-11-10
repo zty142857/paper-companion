@@ -19,8 +19,6 @@ import os
 import re
 import statistics
 
-import pymupdf
-
 EQNUM_RE = re.compile(r"^\(\s*(\d{1,2}[a-z]?)\s*\)$")
 _URL_RE = re.compile(r"(https?://|www\.|@|\.(com|org|net|edu)\b)", re.I)
 _CAPTION_RE = re.compile(r"^(figure|fig\.|table|tab\.|algorithm|scheme)\b", re.I)
@@ -206,10 +204,6 @@ def keep_box(b: tuple, pictures: list[tuple], page_h: float) -> bool:
     if any(_inter(b, p) / max(1e-6, _area(b)) >= 0.85 for p in pictures):
         return False
     return True
-
-
-def filter_boxes(boxes: list[tuple], pictures: list[tuple], page_h: float) -> list[tuple]:
-    return [b for b in boxes if keep_box(b, pictures, page_h)]
 
 
 # ---------------- 版面框切分 ----------------

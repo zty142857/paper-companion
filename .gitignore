@@ -29,6 +29,9 @@ frontend/public/models/
 
 # 本地阅读/收藏的论文 PDF，属于个人数据，不入库
 /*.pdf
+# 手动收集的论文语料 / 测试集（个人数据，不入库）
+/read/
+/测试集/
 
 # 开发过程产物：本地改动备份、布局对比截图
 paper-companion-backup-*/

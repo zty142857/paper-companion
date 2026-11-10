@@ -4,7 +4,7 @@
 
 > 所有数据（论文、笔记、卡片）都保存在**你自己的电脑**上。只有调用 AI 功能时，相关论文片段会发送到你配置的模型服务商。
 
-**不想装环境？** 到 [Releases](releases) 下载对应系统的压缩包，解压后双击启动脚本即可，**不需要安装 Python 或 Node**（见 [第 2 节](#2-快速开始下载即用)）。
+**不想装环境？** 到 [Releases](https://github.com/zty142857/paper-companion/releases) 下载对应系统的压缩包，解压后双击启动脚本即可，**不需要安装 Python 或 Node**（见 [第 2 节](#2-快速开始下载即用)）。
 
 ## 目录
 1. [功能一览](#1-功能一览)
@@ -22,7 +22,7 @@
 
 | 功能 | 说明 |
 |---|---|
-| **上传论文** | 拖拽或点击上传 PDF，自动解析标题、章节、段落（约 5–15 秒），单栏双栏都能读 |
+| **批量上传** | 拖拽或点击一次选择多篇 PDF；后台逐篇解析，列表显示「解析中 / 已解析 / 解析失败」，完成后不会自动打开 |
 | **摸底问卷** | 上传后自动弹窗：识别论文领域，问你熟悉度、勾选已懂术语 |
 | **阅读计划** | 根据你的画像生成可调整的阅读计划（重点关注 / 建议略读 / 阅读建议） |
 | **全文导读** | 六要素（一句话总览 / 研究问题 / 方法 / 创新点 / 实验与结果 / 局限），带页码可点击跳转，并做事实自查 |
@@ -37,12 +37,13 @@
 | **文件夹** | 主页左侧按课题建文件夹；论文可移动或在文件夹间复制成独立副本；推荐只读取当前文件夹的阅读历史 |
 | **全文检索** | 工作台顶栏「全文检索」：在**当前论文**全文中找关键词，点结果跳页并精确高亮命中词 |
 | **原文标亮** | 鼠标拖选正文 → 浮动调色板（黄/绿/蓝/粉）；标亮持久化，点击可换色或删除 |
+| **划词翻译** | 拖选正文 → 浮动条「译」→ 选区旁弹出译文，可复制或存为译文卡；自动结合所在段落理解语境 |
 | **笔记卡** | 段落工具条「记笔记」→ 右/左轨生成笔记卡，就地编辑、失焦自动保存 |
 | **公式识别** | 拖选公式，或用「∑ 框选公式」拖矩形 → 浏览器本地 OCR 识别为 LaTeX，可复制 LaTeX / 纯文本 / 图片；笔记与对话用 KaTeX 渲染 `$...$` |
 | **表格** | 点击表格 → 查看 / 复制图片 / 问这张表；表题进入导读，表内文字不污染正文摘要；旋转或字体乱码的表格只提供图片 |
 | **推荐 DOI** | 推荐改为「检索优先」：模型只给检索方向，后端到 OpenAlex / Crossref / Semantic Scholar / arXiv 找真实论文，DOI 来自数据库；每条都真实可查 |
 | **收藏与记忆** | 收藏论文进文献库；已懂术语跳过；推荐基于你的阅读历史 |
-| **文献综述** | 主页勾选 ≥2 篇论文，一键生成对比综述 |
+| **文献综述** | 主页勾选 ≥2 篇已生成导读的论文，一键生成对比综述 |
 | **全篇自测** | 读完后出 2 选择题 + 1 简答题，错题可跳回原文；题目与作答会留存，重开接着做 |
 | **隐私与数据** | 查看数据说明，一键清除全部本地数据 |
 
@@ -50,7 +51,7 @@
 
 ## 2. 快速开始（下载即用）
 
-1. 到 [Releases](releases) 下载对应你系统的包：
+1. 到 [Releases](https://github.com/zty142857/paper-companion/releases) 下载对应你系统的包：
 
    | 你的系统 | 下载文件 |
    | --- | --- |
@@ -104,8 +105,10 @@
 ## 4. 各功能怎么用
 
 ### 4.1 上传与摸底
-- 首页把 PDF 拖到虚线框，或点击选择文件。
-- 进入工作台后**自动弹出摸底问卷**：确认 / 修改领域 → 选熟悉度（新手 / 进阶 / 熟手）→ 勾选已懂术语 → 提交。
+- 首页把 PDF 拖到虚线框，或点击选择文件；支持**一次选择/拖入多篇**，都会归入当前选中的文件夹。
+- 上传后**留在首页**，不会自动打开论文。列表里先显示「解析中…」，后台按选择顺序逐篇解析，完成后自动变成「已解析」；期间可以继续浏览或关闭页面。
+- 某篇解析失败时只影响它自己，其余论文照常解析；失败行会显示「解析失败」，点「重试」即可重新解析，不用重新上传。
+- 打开已解析的论文并进入工作台后**自动弹出摸底问卷**：确认 / 修改领域 → 选熟悉度（新手 / 进阶 / 熟手）→ 勾选已懂术语 → 提交。
 - 同领域论文会显示「沿用上次摸底」。
 
 ### 4.2 生成导读
@@ -115,6 +118,7 @@
 
 ### 4.3 精读与互动
 - 在 PDF 区域**点击任意段落** → 弹出工具条：翻译此段 / 就此段提问 / 问全文 / 通俗讲解。
+- 同一段正文恰好**跨页**时，解析器会把它还原成一个逻辑段落：翻译/导读/上下文不会出现半段，卡片页码显示为「第 N–M 页」，点击仍按你实际点的那一页锚定。
 - 「问全文」生成的卡片带 🌐 标记：虽然锚在你点的那段旁，但回答**基于整篇论文**（全文导读 + 各节概要 + 目录），适合问"创新点是什么""各章怎么支撑结论"这类全局问题；细节问题仍用「就此段提问」。顶栏「问全篇」是同一功能的无锚点入口。
 - 生成的卡片出现在右侧轨道，**拖动卡片头**可重新锚定到别的段落；拖右边缘可改宽度；✕ 删除（有确认）。
 - 子对话可多轮追问；回答里的 `[块ID]` 表示出处，页码按钮可跳转。
@@ -127,7 +131,7 @@
 ### 4.5 检索 / 推荐 / 综述
 - 导读区下方检索框可搜 arXiv / Semantic Scholar。
 - 顶部「**推荐**」按阅读历史推荐 3 篇；优先只读当前文件夹，找不到同文件夹历史时退到同领域。流程是「模型只给检索方向 → 后端到 OpenAlex / Crossref / S2 / arXiv 检索真实论文 → 模型基于真实标题/摘要写理由」，所以每条都有可验证 DOI，不再展示模型编造的题名。
-- 主页「**文献综述**」→ 勾选 ≥2 篇 → 生成对比综述。
+- 主页「**文献综述**」→ 勾选 ≥2 篇**已生成导读**的论文 → 生成对比综述（未生成导读的论文会在选择框里标注并禁用）。
 
 ### 4.6 全篇自测
 - 滚到全文末尾会出现提示条，或点顶部「**全篇自测**」。
@@ -144,6 +148,7 @@
 ### 4.8 全文检索 / 标亮 / 笔记
 - 顶栏「**全文检索**」只搜当前论文：回车列出命中段落，点结果跳到对应页并临时高亮关键词。
 - 在 PDF 上**拖选文字** → 出现调色板，选黄/绿/蓝/粉即完成标亮；重开论文仍保留。点已有标亮可换色或删除。
+- 同一个浮动条上点「**译**」→ 选区旁弹出划词翻译；只会翻译选中的文字，后端自动用所在段落和前后文理解指代。译文可复制，也可「存为卡片」放进卡片轨。
 - 点击正文段落 → 工具条「**记笔记**」，笔记卡出现在对应侧的卡片轨；点开输入，失焦自动保存。
 - 双栏论文：左栏段落对应的卡片/术语/笔记放在**左侧卡片轨**；单栏论文统一放在右侧。章节概要侧边栏展开时会盖住左轨，点顶栏「☰ 章节」可收起。
 
@@ -180,7 +185,7 @@
 
 ### 通用前置要求
 - **Node.js ≥ 20.19 或 ≥ 22.12**（Vite 8 要求；版本太低会导致页面打不开）
-- **Python 3.14** + 包管理器 [uv](https://docs.astral.sh/uv/)（推荐），或系统 pip
+- **Python 3.12+**（CI 用 3.12 构建发行包；本机用 3.14 也可）+ 包管理器 [uv](https://docs.astral.sh/uv/)（推荐），或系统 pip
 - 能联网（首次装依赖 + 调用模型）
 - 公式识别首次使用前在 `frontend` 下运行 `npm run model:download`，下载约 77MB 的本地 OCR 模型（见 4.9）
 
@@ -197,7 +202,7 @@ export PATH="$HOME/.local/bin:$PATH"     # 或加入 ~/.bashrc
 
 # 3. 装依赖
 cd paper-companion
-uv venv backend/.venv --python 3.14
+uv venv backend/.venv --python 3.12
 uv pip install -p backend/.venv fastapi "uvicorn[standard]" "pymupdf>=2.0,<3" httpx openai python-multipart
 cd frontend && npm install && npm install pdfjs-dist @rolldown/binding-linux-x64-gnu && cd ..
 
@@ -214,7 +219,7 @@ brew install node uv
 
 # 2. 装依赖
 cd paper-companion
-uv venv backend/.venv --python 3.14
+uv venv backend/.venv --python 3.12
 uv pip install -p backend/.venv fastapi "uvicorn[standard]" "pymupdf>=2.0,<3" httpx openai python-multipart
 cd frontend && npm install && cd ..
 
@@ -236,7 +241,7 @@ bash start.sh
 # 1. 安装 Node（官网 LTS，或 winget install OpenJS.NodeJS）与 uv（winget install astral-sh.uv）
 # 2. 装依赖
 cd paper-companion
-uv venv backend\.venv --python 3.14
+uv venv backend\.venv --python 3.12
 uv pip install -p backend\.venv fastapi "uvicorn[standard]" "pymupdf>=2.0,<3" httpx openai python-multipart
 cd frontend; npm install; cd ..
 
@@ -259,12 +264,22 @@ bash start.sh     # 检查依赖 → 关掉旧后端 → 起后端 → 起前端
 
 ### 5.5 打安装包（可选）
 ```bash
-python packaging/build.py --target win-x64      # 或 linux-x64 / macos-x64 / macos-arm64
+python packaging/build.py --target win-x64      # 或 linux-x64 / macos-arm64
 ```
-产物在 `release/`。推 `v*` tag 会由 GitHub Actions 自动在四个平台上构建并发布到 Releases。
+产物在 `release/`。推 `v*` tag 会由 GitHub Actions 自动在三个平台上构建并发布到 Releases（macOS Intel 暂不提供免安装包，见第 2 节）。
 
 打包前需要有公式模型（`frontend/public/models/formulanet`，用 `npm run model:download` 下载）；缺模型时会直接报错，确认要打一个不含公式识别的包时加 `--allow-missing-model`。
 构建过程会自动裁掉运行时不用的文件（PyMuPDF 里未使用的版面模型、`mupdf-devel` 编译头、onnxruntime 的模型转换工具链），详见 `prune_bundle()`。
+
+后端测试（纯逻辑，不需要 API Key；`tests/test_table_regions.py` 里的样本集成测试只在 `backend/data/pdfs` 有对应 PDF 时运行）：
+
+```bash
+python tests/test_formula_regions.py
+python tests/test_page_continuation.py
+python tests/test_translate_selection.py
+python tests/test_table_regions.py
+python tests/test_model_settings.py
+```
 
 ---
 
@@ -328,6 +343,8 @@ paper-companion/
 ├─ backend/            # FastAPI 后端
 │  └─ app/
 │     ├─ pdf_parse.py    # PDF → 块 / 章节（行级标题判定、双栏检测）
+│     ├─ textblocks.py   # 跨页段落合并：逻辑段落 / 页码文案 / 块 ID 映射
+│     ├─ formula_regions.py # 公式区域检测（PyMuPDF 版面模型 + 启发式回退）
 │     ├─ table_regions.py # 表格区域 / 单元格 / 表题 / 质量降级
 │     ├─ summarize.py    # 全文导读、各节概要、术语、digest 预算分配
 │     ├─ ai.py           # 翻译 / 子对话 / 术语解释（含全篇上下文）
@@ -345,7 +362,7 @@ paper-companion/
 │     ├─ TermItem.tsx      # 术语小卡 → 解释卡
 │     ├─ QuizModal.tsx     # 全篇自测
 │     └─ Home.tsx / SettingsModal.tsx / ProfileModal.tsx / PlanCard.tsx
-├─ packaging/build.py  # 四平台打包（PyInstaller）
+├─ packaging/build.py  # 三平台打包（PyInstaller）
 ├─ .github/workflows/  # 推 tag 自动构建并发布 Releases
 └─ start.sh            # 开发模式一键启动
 ```

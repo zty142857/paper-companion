@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"失败 {pid}：{e}")
             failed += 1
             continue
-        print(f"{'[dry-run] ' if args.dry_run else ''}{pid} {row['title'][:40]!r} -> {len(formulas)} 个公式区域")
+        print(f"{'[dry-run] ' if args.dry_run else ''}{pid} {(row.get('title') or '')[:40]!r} -> {len(formulas)} 个公式区域")
         if args.dry_run:
             done += 1
             continue

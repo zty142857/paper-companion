@@ -94,6 +94,14 @@ export default function PaperView({ id }: { id: string }) {
   const [tableCopied, setTableCopied] = useState(false)
   const [tableBusy, setTableBusy] = useState(false)
   const [selected, setSelected] = useState<SelectedText | null>(null)
+  const [selTrans, setSelTrans] = useState<{
+    text: string; translation: string; error: string; pending: boolean
+    x: number; y: number; page: number; blockId: string; saved: boolean
+  } | null>(null)
+  const [selTransCopied, setSelTransCopied] = useState(false)
+  const selTransSeq = useRef(0)
+  const searchSeq = useRef(0)
+  const formulaSeq = useRef(0)
   const [hlMenu, setHlMenu] = useState<{ id: string; color: string; x: number; y: number } | null>(null)
   const [formulaBusy, setFormulaBusy] = useState(false)
   const [formulaStep, setFormulaStep] = useState('')
@@ -114,10 +122,12 @@ export default function PaperView({ id }: { id: string }) {
   const onReady = useCallback((h: ViewerHandle) => { viewer.current = h }, [])
 
   const loadProfile = useCallback(() => {
-    api.profile(id).then((d) => {
+    const reqId = id
+    api.profile(reqId).then((d) => {
+      if (paperIdRef.current !== reqId) return
       setCollected(!!d.meta?.collected)
-      setKnownTerms(d.meta?.known_terms ?? [])
-      setDismissedTerms(d.meta?.dismissed_terms ?? [])
+      setKnownTerms(Array.isArray(d.meta?.known_terms) ? d.meta.known_terms : [])
+      setDismissedTerms(Array.isArray(d.meta?.dismissed_terms) ? d.meta.dismissed_terms : [])
       setPlan(d.meta?.plan ?? null)
     }).catch(() => {})
   }, [id])
@@ -141,10 +151,14 @@ export default function PaperView({ id }: { id: string }) {
 
   useEffect(() => {
     setPaper(null); setErr(''); setCards([]); setTops({})
+    setDisplayTops({}); setTermTops({}); setActiveId(null)
+    setBusy(false); setPlanBusy(false); setRecBusy(false); setSearchBusy(false)
     setPlan(null); setShowPlan(false); setRecs(null); setSearchRes(null); setSteps([])
-    setRecNote('')
-    setDismissedTerms([])
+    setRecNote(''); setQuery(''); setCollected(false); setKnownTerms([])
+    setDismissedTerms([]); setAtEnd(false); setProfile(false); setQuiz(false)
     setHighlights([]); setSelected(null); setHlMenu(null)
+    setSelTrans(null); setSelTransCopied(false); selTransSeq.current += 1
+    searchSeq.current += 1; formulaSeq.current += 1
     setTables([]); setTablesLoading(false); setTablesErr(''); setTableTool(null); setTableView(null)
     setTableBusy(false); setTableCopied(false)
     setFormulaBusy(false); setFormulaStep(''); setFormulaErr(''); setFormulaResult(null); setFormulaCopied('')
@@ -161,12 +175,18 @@ export default function PaperView({ id }: { id: string }) {
     }).catch((e) => {
       if (paperIdRef.current === id) setErr(String(e?.message || e))
     })
-    api.cards(id).then(setCards).catch(() => {})
-    api.highlights(id).then(setHighlights).catch(() => {})
+    // 切换论文时旧请求可能后返回：统一按当前 id 丢弃，避免把上一篇的卡片/标亮盖到这一篇
+    api.cards(id).then((cs) => {
+      if (paperIdRef.current === id) setCards(cs)
+    }).catch(() => {})
+    api.highlights(id).then((hs) => {
+      if (paperIdRef.current === id) setHighlights(hs)
+    }).catch(() => {})
     api.profile(id).then((d) => {
+      if (paperIdRef.current !== id) return
       setCollected(!!d.meta?.collected)
-      setKnownTerms(d.meta?.known_terms ?? [])
-      setDismissedTerms(d.meta?.dismissed_terms ?? [])
+      setKnownTerms(Array.isArray(d.meta?.known_terms) ? d.meta.known_terms : [])
+      setDismissedTerms(Array.isArray(d.meta?.dismissed_terms) ? d.meta.dismissed_terms : [])
       if (d.meta?.plan) setPlan(d.meta.plan)
       if (!d.meta?.domain) setProfile(true)   // 未做过摸底 → 上传后立即弹问卷
     }).catch(() => {})
@@ -184,20 +204,20 @@ export default function PaperView({ id }: { id: string }) {
     if (!compact) setNarrowSections(false)
   }, [compact])
 
-  // 点空白处收起标亮调色板 / 高亮菜单 / 公式弹窗 / 表格工具条与图片
+  // 点空白处收起标亮调色板 / 高亮菜单 / 公式弹窗 / 表格工具条与图片 / 划词翻译
   useEffect(() => {
-    if (!selected && !hlMenu && !formulaResult && !tableTool && !tableView) return
+    if (!selected && !hlMenu && !formulaResult && !tableTool && !tableView && !selTrans) return
     const down = (e: MouseEvent) => {
       const t = e.target as HTMLElement
       if (t.closest('.sel-palette') || t.closest('.hl-menu') || t.closest('.formula-pop')
-        || t.closest('.toolbar-pop') || t.closest('.table-pop')) return
+        || t.closest('.toolbar-pop') || t.closest('.table-pop') || t.closest('.sel-trans-pop')) return
       setSelected(null); setHlMenu(null); setFormulaResult(null)
-      setTableTool(null); setTableView(null)
+      setTableTool(null); setTableView(null); setSelTrans(null)
       viewer.current?.clearSelection()
     }
     addEventListener('mousedown', down)
     return () => removeEventListener('mousedown', down)
-  }, [selected, hlMenu, formulaResult, tableTool, tableView])
+  }, [selected, hlMenu, formulaResult, tableTool, tableView, selTrans])
 
   useEffect(() => {
     if (!tableTool && !tableView) return
@@ -209,19 +229,42 @@ export default function PaperView({ id }: { id: string }) {
     return () => removeEventListener('keydown', esc)
   }, [tableTool, tableView])
 
+  useEffect(() => {
+    if (!selTrans) return
+    const esc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSelTrans(null)
+    }
+    addEventListener('keydown', esc)
+    return () => removeEventListener('keydown', esc)
+  }, [selTrans])
+
   const analyze = async () => {
+    const reqId = id
     setBusy(true); setErr('')
-    try { const a = await api.analyze(id); setPaper((p) => p && { ...p, analysis: a }) }
-    catch (e: any) { setErr(`导读失败：${e?.message || e}`) }
-    finally { setBusy(false) }
+    try {
+      const a = await api.analyze(reqId)
+      if (paperIdRef.current !== reqId) return
+      setPaper((p) => p && { ...p, analysis: a })
+    } catch (e: any) {
+      if (paperIdRef.current === reqId) setErr(`导读失败：${e?.message || e}`)
+    } finally {
+      if (paperIdRef.current === reqId) setBusy(false)
+    }
   }
 
   const genPlan = async () => {
     if (planBusy) return
+    const reqId = id
     setPlanBusy(true); setErr('')
-    try { setPlan(await api.makePlan(id)); setShowPlan(true) }
-    catch (e: any) { setErr(`计划生成失败：${e?.message || e}`) }
-    finally { setPlanBusy(false) }
+    try {
+      const next = await api.makePlan(reqId)
+      if (paperIdRef.current !== reqId) return
+      setPlan(next); setShowPlan(true)
+    } catch (e: any) {
+      if (paperIdRef.current === reqId) setErr(`计划生成失败：${e?.message || e}`)
+    } finally {
+      if (paperIdRef.current === reqId) setPlanBusy(false)
+    }
   }
 
   // 点「阅读计划」：有已保存计划则直接展示，否则生成
@@ -231,27 +274,44 @@ export default function PaperView({ id }: { id: string }) {
   }
 
   const toggleCollect = async () => {
+    const reqId = id
     const v = !collected
     setCollected(v)
-    try { await api.collect(id, v) } catch { setCollected(!v) }
+    try {
+      await api.collect(reqId, v)
+    } catch {
+      if (paperIdRef.current === reqId) setCollected(!v)
+    }
   }
 
   const doRecommend = async () => {
     if (recBusy) return
+    const reqId = id
     setRecBusy(true); setErr('')
     try {
-      const d = await api.recommend(id)
+      const d = await api.recommend(reqId)
+      if (paperIdRef.current !== reqId) return
       setRecs(d.items); setRecScope(d.scope_label || ''); setRecNote(d.note || '')
-    } catch (e: any) { setErr(`推荐失败：${e?.message || e}`) }
-    finally { setRecBusy(false) }
+    } catch (e: any) {
+      if (paperIdRef.current === reqId) setErr(`推荐失败：${e?.message || e}`)
+    } finally {
+      if (paperIdRef.current === reqId) setRecBusy(false)
+    }
   }
 
   const doSearch = async () => {
     if (!query.trim()) return
+    const reqId = id
+    const seq = ++searchSeq.current
     setSearchBusy(true); setErr('')
-    try { setSearchRes((await api.search({ q: query, source: 'both' })).results) }
-    catch (e: any) { setErr(String(e?.message || e)) }
-    finally { setSearchBusy(false) }
+    try {
+      const results = (await api.search({ q: query, source: 'both' })).results
+      if (paperIdRef.current === reqId && seq === searchSeq.current) setSearchRes(results)
+    } catch (e: any) {
+      if (paperIdRef.current === reqId && seq === searchSeq.current) setErr(String(e?.message || e))
+    } finally {
+      if (paperIdRef.current === reqId && seq === searchSeq.current) setSearchBusy(false)
+    }
   }
 
   const blocks = useMemo(() => paper?.structure.blocks ?? [], [paper?.structure.blocks])
@@ -310,15 +370,25 @@ export default function PaperView({ id }: { id: string }) {
   }, [blockMap, pageCols])
 
   // 已懂术语匹配：忽略大小写/空格，并支持中英文任意一侧命中
-  const norm = (s: string) => s.toLowerCase().replace(/[\s()（）\-]/g, '')
+  const norm = (s: string) => String(s ?? '').toLowerCase().replace(/[\s()（）-]/g, '')
   const visibleTerms = useMemo(() => {
     const knownNorm = knownTerms.map(norm)
     const isKnown = (t: { term: string; zh: string }) => {
       const a = norm(t.term), b = norm(t.zh)
-      return knownNorm.some((k) => k && (a.includes(k) || k.includes(a) || b.includes(k) || k.includes(b)))
+      return knownNorm.some((k) => k && (
+        (a && (a.includes(k) || k.includes(a)))
+        || (b && (b.includes(k) || k.includes(b)))
+      ))
     }
     return (paper?.analysis?.terms ?? [])
       .filter((t) => !isKnown(t) && !dismissedTerms.includes(t.term))
+      .map((t) => ({
+        ...t,
+        term: String(t.term ?? ''),
+        zh: String(t.zh ?? ''),
+        refs: Array.isArray(t.refs) ? t.refs : [],
+        pages: Array.isArray(t.pages) ? t.pages : [],
+      }))
   }, [paper?.analysis, knownTerms, dismissedTerms])
   const visibleTermsRef = useRef(visibleTerms)
   visibleTermsRef.current = visibleTerms
@@ -402,14 +472,17 @@ export default function PaperView({ id }: { id: string }) {
   }, [paper])
 
   const addCard = async (type: string, blockId: string, data: any) => {
+    const reqId = id
     const b = blockMap[blockId]
     const r = rightRail.current || leftRail.current
     const top = b && viewer.current && r
       ? (viewer.current.blockTop(b.page, b.y0, r) ?? 0) : 0
-    const { id: cid } = await api.addCard(id, { type, block_id: blockId, top, data })
-    const c: Card = { id: cid, paper_id: id, type, block_id: blockId, top, data, created_at: Date.now() / 1000 }
-    setCards((cs) => [...cs, c])
-    setTops((t) => ({ ...t, [cid]: top }))
+    const { id: cid } = await api.addCard(reqId, { type, block_id: blockId, top, data })
+    const c: Card = { id: cid, paper_id: reqId, type, block_id: blockId, top, data, created_at: Date.now() / 1000 }
+    if (paperIdRef.current === reqId) {
+      setCards((cs) => [...cs, c])
+      setTops((t) => ({ ...t, [cid]: top }))
+    }
     return c
   }
 
@@ -419,7 +492,8 @@ export default function PaperView({ id }: { id: string }) {
     const c = await addCard('translation', blockId, { orig, pending: true })
     try {
       const r = await api.translate(id, blockId)
-      const data = { ...c.data, translation: r.translation, page: r.page, pending: false }
+      const data = { ...c.data, orig: (r.text || c.data.orig || '').slice(0, 160),
+        translation: r.translation, page: r.page, pending: false }
       setCards((cs) => cs.map((x) => x.id === c.id ? { ...x, data } : x))
       api.patchCard(c.id, { data })
     } catch (e: any) {
@@ -430,25 +504,32 @@ export default function PaperView({ id }: { id: string }) {
   }
 
   const askChat = async (card: Card, question: string) => {
+    const reqId = id
     const msgs: any[] = card.data.messages ?? []
     const next = [...msgs, { role: 'user', content: question }]
     setCards((cs) => cs.map((c) => c.id === card.id ? { ...c, data: { ...c.data, messages: next } } : c))
     const anchor = card.block_id
     try {
-      const r = await api.chat(id, {
+      const r = await api.chat(reqId, {
         block_ids: card.data.block_ids ?? [card.block_id].filter(Boolean),
         history: next, question,
         table_id: card.data.table_id || undefined,
       })
-      if (r.steps?.length) {
+      if (paperIdRef.current === reqId && r.steps?.length) {
         setSteps((s) => [...s, ...r.steps!.map((st) => ({ blockId: anchor, text: st.text }))])
       }
       const done = [...next, { role: 'assistant', content: r.answer, refs: r.refs, pages: r.pages }]
-      setCards((cs) => cs.map((c) => c.id === card.id ? { ...c, data: { ...c.data, messages: done } } : c))
-      api.patchCard(card.id, { data: { ...card.data, messages: done } })
+      if (paperIdRef.current === reqId) {
+        setCards((cs) => cs.map((c) => c.id === card.id ? { ...c, data: { ...c.data, messages: done } } : c))
+      }
+      api.patchCard(card.id, { data: { ...card.data, messages: done } }).catch(() => {})
     } catch (e: any) {
       const done = [...next, { role: 'assistant', content: `请求失败：${e?.message || e}` }]
-      setCards((cs) => cs.map((c) => c.id === card.id ? { ...c, data: { ...c.data, messages: done } } : c))
+      if (paperIdRef.current === reqId) {
+        setCards((cs) => cs.map((c) => c.id === card.id ? { ...c, data: { ...c.data, messages: done } } : c))
+      }
+      // 失败也尽量落库：刷新后至少保留用户的问题和错误提示
+      api.patchCard(card.id, { data: { ...card.data, messages: done } }).catch(() => {})
     }
   }
 
@@ -498,15 +579,23 @@ export default function PaperView({ id }: { id: string }) {
 
   const showTable = async (table: TableBox, x: number, y: number) => {
     if (tableBusy) return
+    const reqId = id
     setTableBusy(true)
     try {
       const blob = await viewer.current?.cropTable(table.page, table, 4)
       if (!blob) throw new Error('截图失败')
       const url = URL.createObjectURL(blob)
+      if (paperIdRef.current !== reqId) {
+        URL.revokeObjectURL(url)
+        return
+      }
       setTableView({ table, blob, url, x, y })
       setTableTool(null)
-    } catch (e: any) { setErr(`查看表格失败：${e?.message || e}`) }
-    finally { setTableBusy(false) }
+    } catch (e: any) {
+      if (paperIdRef.current === reqId) setErr(`查看表格失败：${e?.message || e}`)
+    } finally {
+      if (paperIdRef.current === reqId) setTableBusy(false)
+    }
   }
 
   const copyTable = async (table: TableBox) => {
@@ -549,27 +638,35 @@ export default function PaperView({ id }: { id: string }) {
   // ---------- 公式识别 ----------
   const runFormula = async (blob: Blob, x: number, y: number) => {
     if (formulaBusy) return
+    const reqId = id
+    const seq = ++formulaSeq.current
+    const alive = () => paperIdRef.current === reqId && seq === formulaSeq.current
     setFormulaErr('')
     setFormulaCopied('')
     setFormulaBusy(true)
     setFormulaStep('正在识别公式…')
     try {
       const raw = await recognizeFormula(blob, (p) => {
+        if (!alive()) return
         if (p.progress != null) setFormulaStep(`加载公式模型 ${Math.round(p.progress)}%`)
         else if (p.file) setFormulaStep('加载公式模型…')
       })
+      if (!alive()) return
       const latex = normalizeLatex(raw)
       if (!latex) throw new Error('没有识别出公式，请重新框选')
       setFormulaResult({ latex, text: latexToText(latex), blob, x, y })
       window.getSelection()?.removeAllRanges()
     } catch (e: any) {
+      if (!alive()) return
       const msg = String(e?.message || e)
       setFormulaErr(/formulanet|local|fetch|404|model/i.test(msg)
         ? '公式模型未加载，请先在 frontend 目录运行 npm run model:download，然后重试'
         : msg)
     } finally {
-      setFormulaBusy(false)
-      setFormulaStep('')
+      if (alive()) {
+        setFormulaBusy(false)
+        setFormulaStep('')
+      }
     }
   }
 
@@ -618,17 +715,69 @@ export default function PaperView({ id }: { id: string }) {
     }
   }
 
-  // ---------- 标亮 ----------
-  const saveHighlight = async (color: string) => {
+  // ---------- 划词翻译 ----------
+  const doSelectionTranslate = async () => {
     if (!selected) return
     const s = selected
     setSelected(null)
     viewer.current?.clearSelection()
     window.getSelection()?.removeAllRanges()
+    const seq = ++selTransSeq.current
+    setSelTransCopied(false)
+    setSelTrans({
+      text: s.text, translation: '', error: '', pending: true,
+      x: s.x, y: s.y, page: s.page, blockId: '', saved: false,
+    })
     try {
-      const h = await api.addHighlight(id, { page: s.page, color, text: s.text, rects: s.rects })
-      setHighlights((hs) => [...hs, h])
-    } catch (e: any) { setErr(`标亮保存失败：${e?.message || e}`) }
+      const r = await api.translateSelection(id, { text: s.text })
+      if (selTransSeq.current !== seq) return   // 已开始新的划词翻译，丢弃旧响应
+      setSelTrans((t) => t ? {
+        ...t, translation: r.translation, blockId: r.block_id || '',
+        page: r.page || t.page, pending: false,
+      } : t)
+    } catch (e: any) {
+      if (selTransSeq.current !== seq) return
+      setSelTrans((t) => t ? { ...t, error: String(e?.message || e), pending: false } : t)
+    }
+  }
+
+  const copySelTrans = async () => {
+    if (!selTrans?.translation) return
+    try {
+      await copyText(selTrans.translation)
+      setSelTransCopied(true)
+      window.setTimeout(() => setSelTransCopied(false), 1600)
+    } catch (e: any) { setErr(`复制失败：${e?.message || e}`) }
+  }
+
+  const saveSelTrans = async () => {
+    if (!selTrans?.translation || selTrans.saved) return
+    const t = selTrans
+    const fallback = blocks.find((b) => b.type === 'para' || b.type === 'heading')
+    const blockId = t.blockId || fallback?.id
+    if (!blockId) { setErr('没有可锚定的段落，无法存为卡片'); return }
+    try {
+      await addCard('translation', blockId, {
+        orig: t.text, translation: t.translation, page: t.page || blockMap[blockId]?.page, selection: true,
+      })
+      setSelTrans((x) => x ? { ...x, saved: true } : x)
+    } catch (e: any) { setErr(`存为卡片失败：${e?.message || e}`) }
+  }
+
+  // ---------- 标亮 ----------
+  const saveHighlight = async (color: string) => {
+    if (!selected) return
+    const reqId = id
+    const s = selected
+    setSelected(null)
+    viewer.current?.clearSelection()
+    window.getSelection()?.removeAllRanges()
+    try {
+      const h = await api.addHighlight(reqId, { page: s.page, color, text: s.text, rects: s.rects })
+      if (paperIdRef.current === reqId) setHighlights((hs) => [...hs, h])
+    } catch (e: any) {
+      if (paperIdRef.current === reqId) setErr(`标亮保存失败：${e?.message || e}`)
+    }
   }
 
   const changeHighlight = async (color: string) => {
@@ -645,11 +794,19 @@ export default function PaperView({ id }: { id: string }) {
 
   const removeHighlight = async () => {
     if (!hlMenu) return
+    const reqId = id
     const m = hlMenu
     setHlMenu(null)
     setHighlights((hs) => hs.filter((h) => h.id !== m.id))
     try { await api.deleteHighlight(m.id) }
-    catch (e: any) { setErr(`删除标亮失败：${e?.message || e}`); api.highlights(id).then(setHighlights).catch(() => {}) }
+    catch (e: any) {
+      if (paperIdRef.current === reqId) {
+        setErr(`删除标亮失败：${e?.message || e}`)
+        api.highlights(reqId).then((hs) => {
+          if (paperIdRef.current === reqId) setHighlights(hs)
+        }).catch(() => {})
+      }
+    }
   }
 
   // ---------- 本篇全文检索 ----------
@@ -679,10 +836,13 @@ export default function PaperView({ id }: { id: string }) {
   }
 
   const goFind = (h: { page: number }) => {
+    const reqId = id
     setFindOpen(false)
     viewer.current?.scrollToPage(h.page)
     const q = findQ.trim().split(/\s+/)[0]
-    window.setTimeout(() => viewer.current?.flashText(h.page, q), 420)
+    window.setTimeout(() => {
+      if (paperIdRef.current === reqId) viewer.current?.flashText(h.page, q)
+    }, 420)
   }
 
   // 找到某术语背后已持久化的解释卡
@@ -859,12 +1019,12 @@ export default function PaperView({ id }: { id: string }) {
           </div>}
           {busy && !analysis && <div className="loading">正在通读全文并生成导读（含术语提取与事实自查）…</div>}
           <div className="grid">
-            {analysis?.elements.map((e) => (
-              <div className="el" key={e.kind}>
-                <div className="k">{e.kind}{e.checked && <span className="ok" title="已对照原文核查">✓ 已自查</span>}</div>
-                <div className="x">{e.text}</div>
+            {(analysis?.elements ?? []).map((e) => (
+              <div className="el" key={String(e.kind)}>
+                <div className="k">{String(e.kind)}{e.checked && <span className="ok" title="已对照原文核查">✓ 已自查</span>}</div>
+                <div className="x">{String(e.text ?? '')}</div>
                 <div className="src">
-                  {e.pages.map((p) => <button key={p} onClick={() => jump(p)}>📄 第{p}页</button>)}
+                  {(e.pages ?? []).map((p) => <button key={p} onClick={() => jump(p)}>📄 第{p}页</button>)}
                 </div>
               </div>
             ))}
@@ -882,7 +1042,8 @@ export default function PaperView({ id }: { id: string }) {
                 <div key={s.id} className={`sec d${d}`} onClick={() => jump(s.page)} title={`第 ${s.page} 页`}
                   style={d > 0 ? { paddingLeft: 10 + (d - 1) * 14 } : undefined}>
                   <div className={d <= 1 ? 'lv1' : 'lv2'}>{s.title}</div>
-                  {outlineMap[s.id] && <div className="o">{outlineMap[s.id]}</div>}
+                  {typeof outlineMap[s.id] === 'string' && outlineMap[s.id]
+                    && <div className="o">{outlineMap[s.id]}</div>}
                 </div>
               )
             })}
@@ -899,7 +1060,7 @@ export default function PaperView({ id }: { id: string }) {
             onLayout={recompute}
             onBlockClick={(blockId, x, y) => setTool({ blockId, x, y })}
             highlights={highlights}
-            onSelectText={setSelected}
+            onSelectText={(s) => { setSelected(s); setSelTrans(null); selTransSeq.current += 1 }}
             onFormulaCrop={formulaCrop}
             formulaRegions={formulaRegions}
             onHighlightClick={(h, x, y) => setHlMenu({ id: h.id, color: h.color, x, y })}
@@ -962,6 +1123,7 @@ export default function PaperView({ id }: { id: string }) {
       {selected && (
         <div className="sel-palette"
           style={{ left: Math.max(8, Math.min(selected.x + 8, innerWidth - 320)), top: Math.max(8, Math.min(selected.y + 10, innerHeight - 52)) }}>
+          <button className="trans-btn" title="翻译选中的文字" onClick={doSelectionTranslate}>译</button>
           <button className="formula-btn" title="识别选中的单个公式；如果选区跨多行，请用 PDF 上方的「∑ 框选公式」"
             onClick={doFormula}>∑ 公式</button>
           <span className="sp-label">标亮</span>
@@ -971,6 +1133,35 @@ export default function PaperView({ id }: { id: string }) {
           ))}
           <button className="x" title="取消"
             onClick={() => { setSelected(null); viewer.current?.clearSelection(); window.getSelection()?.removeAllRanges() }}>✕</button>
+        </div>
+      )}
+      {selTrans && (
+        <div className="sel-trans-pop"
+          style={{
+            left: Math.max(10, Math.min(selTrans.x + 8, innerWidth - 400)),
+            top: Math.max(10, Math.min(selTrans.y + 10, innerHeight - 360)),
+          }}>
+          <div className="st-head">
+            <span>🈶 划词翻译</span>
+            <button className="x" title="关闭" onClick={() => setSelTrans(null)}>✕</button>
+          </div>
+          <div className="st-orig">{selTrans.text}</div>
+          <div className="st-body">
+            {selTrans.pending ? <div className="loading">翻译中…</div>
+              : selTrans.error ? <div className="err">翻译失败：{selTrans.error}</div>
+                : <Markdown className="tr" text={selTrans.translation} />}
+          </div>
+          {!selTrans.pending && !selTrans.error && (
+            <div className="st-actions">
+              <button className="btn small" onClick={copySelTrans}>
+                {selTransCopied ? '已复制译文' : '复制译文'}
+              </button>
+              <button className="btn small primary" disabled={selTrans.saved || !selTrans.translation}
+                onClick={saveSelTrans}>
+                {selTrans.saved ? '已存为卡片' : '存为卡片'}
+              </button>
+            </div>
+          )}
         </div>
       )}
       {(formulaBusy || formulaErr) && (
@@ -1059,7 +1250,7 @@ export default function PaperView({ id }: { id: string }) {
       )}
       {tooNarrow && !tipClosed && (
         <div className="narrow-tip">
-          <span>窗口偏窄，论文会偏小。建议把窗口拉宽到 1366 以上。</span>
+          <span>窗口偏窄，论文会偏小。建议把窗口拉宽到 1150 以上。</span>
           <button className="x" title="关闭提示" onClick={() => setTipClosed(true)}>✕</button>
         </div>
       )}

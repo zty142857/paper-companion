@@ -114,7 +114,11 @@ def ensure_migrated() -> None:
     用 setting.llm_schema_v2 做幂等标记；用户之后删光提供商也不会被重新造出来。
     """
     global _MIGRATED
-    if _MIGRATED or db.get_setting("llm_schema_v2") == "1":
+    if _MIGRATED:
+        return
+    if db.get_setting("llm_schema_v2") == "1":
+        # 已经迁移过的旧库：顺手清掉历史遗留的明文 Key（每个进程只做一次）
+        db.delete_setting("llm_api_key")
         _MIGRATED = True
         return
     with _MIGRATE_LOCK:
@@ -140,6 +144,9 @@ def ensure_migrated() -> None:
             db.set_setting("llm_route_default", route)
             db.set_setting("llm_route_translate", route)
         db.set_setting("llm_schema_v2", "1")
+        # 旧版把 Key 明文存在 setting 里；迁移后只保留 provider.api_key，
+        # 否则用户点「清除 Key」也清不掉这份遗留副本。
+        db.delete_setting("llm_api_key")
         _MIGRATED = True
 
 
@@ -155,7 +162,7 @@ def get_route(purpose: str = "default") -> dict:
     if not isinstance(route, dict):
         route = {}
     prov = db.get_provider(route.get("provider_id") or "")
-    model = (route.get("model") or "").strip()
+    model = str(route.get("model") or "").strip()
     if not prov or not model or not (prov.get("base_url") or "").strip():
         raise LLMNotConfigured(p)
     return {
@@ -167,13 +174,8 @@ def get_route(purpose: str = "default") -> dict:
         "headers": prov.get("headers") or {},
         "catalog_id": prov.get("catalog_id"),
         "model": model,
-        "effort": (route.get("effort") or "").strip(),
+        "effort": str(route.get("effort") or "").strip(),
     }
-
-
-def get_llm_config(purpose: str = "default") -> dict:
-    """兼容旧调用：返回当前路由（含明文 key），仅后端内部使用。"""
-    return get_route(purpose)
 
 
 def _client(cfg: dict, timeout: int = 300) -> OpenAI:
@@ -234,7 +236,9 @@ def reasoning_kwargs(cfg: dict) -> dict:
 
 
 def _unsupported(cfg: dict) -> set[str]:
-    return _UNSUPPORTED.setdefault(cfg.get("provider_id") or "?", set())
+    # 按 provider + model 隔离：同一家提供商的不同模型能力可能不同
+    key = f"{cfg.get('provider_id') or '?'}|{cfg.get('model') or ''}"
+    return _UNSUPPORTED.setdefault(key, set())
 
 
 def _mark_unsupported(cfg: dict, param: str) -> None:
@@ -269,7 +273,10 @@ def chat(messages: list[dict], *, purpose: str = "default", json_mode=False,
     while True:
         try:
             r = client.chat.completions.create(**kw)
-            return r.choices[0].message.content or ""
+            choices = getattr(r, "choices", None) or []
+            if not choices:
+                raise RuntimeError("服务商返回了空 choices（可能触发了内容过滤或额度限制）")
+            return choices[0].message.content or ""
         except Exception as e:
             low = str(e).lower()
             # 参数降级阶梯：provider 不支持的可选参数 → 去掉立刻重试（不占瞬时错误重试额度）。
@@ -285,6 +292,10 @@ def chat(messages: list[dict], *, purpose: str = "default", json_mode=False,
             if "extra_body" in kw and ("enable_thinking" in low or "thinking_budget" in low):
                 kw.pop("extra_body")
                 _mark_unsupported(cfg, "extra_body")
+                continue
+            # OpenAI 推理模型要求 max_completion_tokens，旧参数会直接 400
+            if "max_tokens" in kw and "max_completion_tokens" in low:
+                kw["max_completion_tokens"] = kw.pop("max_tokens")
                 continue
             # 限流/5xx/网络抖动：退避后重试一次
             if not retried_transient and _is_transient(e):
@@ -362,9 +373,10 @@ def test_connection(provider_id: str | None = None, overrides: dict | None = Non
         kw.update(sent)
         r = client.chat.completions.create(**kw)
         ms = int((time.time() - t0) * 1000)
+        choices = getattr(r, "choices", None) or []
+        reply = (choices[0].message.content or "").strip()[:24] if choices else ""
         return {"ok": True, "model": cfg["model"], "provider": cfg.get("provider_name", ""),
-                "latency_ms": ms, "reasoning": sent,
-                "reply": (r.choices[0].message.content or "").strip()[:24]}
+                "latency_ms": ms, "reasoning": sent, "reply": reply}
     except Exception as e:
         return {"ok": False, "model": cfg["model"], "provider": cfg.get("provider_name", ""),
                 "latency_ms": int((time.time() - t0) * 1000), "error": brief_error(e)}
@@ -408,7 +420,7 @@ def probe_efforts(provider_id: str, model: str, levels: list[str]) -> dict:
 
 def tone_hint(familiarity: str | None) -> str:
     """按读者熟悉度给出措辞/难度提示，供各功能拼进 prompt。"""
-    fam = (familiarity or "新手").strip()
+    fam = str(familiarity or "新手").strip()
     if fam == "新手":
         return "读者是**新手**：请用最通俗易懂的语言，少用行话；专业名词首次出现时用一句白话或比喻解释。"
     if fam == "熟手":

@@ -1,10 +1,13 @@
 import os
 import sys
 import json
+import queue
 import time
 import shutil
 import threading
 import mimetypes
+from urllib.parse import urlsplit
+
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -19,7 +22,44 @@ mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("text/javascript", ".js")
 
 app = FastAPI(title="paper-companion")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# 只允许本机前端跨域（开发时 Vite 直接访问后端的情况）；打包版同源，不需要 CORS。
+app.add_middleware(CORSMiddleware,
+                   allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+                   allow_origin_regex=r"https?://(127\.0\.0\.1|localhost)(:\d+)?",
+                   allow_methods=["*"], allow_headers=["*"])
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
+
+
+def _hostname(value: str) -> str | None:
+    try:
+        return urlsplit(value).hostname
+    except ValueError:
+        return None
+
+
+@app.middleware("http")
+async def _local_request_guard(request: Request, call_next):
+    """只接受发往本机地址的请求，并挡住恶意网页的跨站写操作。
+
+    - Host 白名单挡住 DNS rebinding（攻击者把 evil.com 解析到 127.0.0.1 时，
+      Origin 和 Host 都是 evil.com，单看 Origin 是拦不住的）。
+    - CORS 只限制读，挡不住简单请求的副作用，所以非安全方法再看 Origin /
+      Sec-Fetch-Site。
+    """
+    host = _hostname("//" + (request.headers.get("host") or ""))
+    if host not in _LOCAL_HOSTS:
+        return JSONResponse(status_code=403, content={"detail": "只允许本机访问"})
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if (request.headers.get("sec-fetch-site") or "").lower() == "cross-site":
+            return JSONResponse(status_code=403, content={"detail": "拒绝跨站请求"})
+        origin = request.headers.get("origin")
+        if origin and _hostname(origin) not in _LOCAL_HOSTS:
+            return JSONResponse(status_code=403, content={"detail": "拒绝跨站请求"})
+    return await call_next(request)
+
+
 db.init()
 llm.ensure_migrated()
 
@@ -35,10 +75,90 @@ def _prefetch_domain_guess(pid: str, structure: dict):
     """解析完成后后台预生成领域猜测并落库，使 /profile 瞬间返回。"""
     def run():
         try:
+            if not db.get_paper(pid):      # 解析期间被删除：别再给幽灵论文写 meta
+                return
             db.upsert_meta(pid, domain_guess=profile.guess_domain(structure))
         except Exception:
             pass
     threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------- 后台解析队列 ----------------
+# 上传只负责落盘 + 入队，立刻返回 id；列表里先显示「解析中」。
+# 单线程串行消费：版面模型很吃 CPU，多篇同时跑会让整机发卡。
+_parse_queue: "queue.Queue[str]" = queue.Queue()
+_parse_worker: threading.Thread | None = None
+_parse_worker_guard = threading.Lock()
+
+
+def _parse_one(pid: str) -> None:
+    p = db.get_paper(pid)
+    if not p or p.get("status") != "parsing":
+        return
+    path = p.get("pdf_path") or os.path.join(db.PDF_DIR, f"{pid}.pdf")
+    if not os.path.isfile(path):
+        guess = os.path.join(db.PDF_DIR, f"{pid}.pdf")
+        if os.path.isfile(guess):
+            path = guess          # 数据目录搬过家后旧绝对路径失效
+        else:
+            db.set_parse_error(pid, "PDF 文件不存在，请重新上传")
+            return
+    try:
+        structure = pdf_parse.parse_pdf(path)
+    except Exception as e:
+        if not db.get_paper(pid):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        db.set_parse_error(pid, f"PDF 解析失败：{e}")
+        return
+    if not db.get_paper(pid):
+        # 解析途中论文被删除：Windows 上当时删不掉（文件被 PyMuPDF 占用），现在补删
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    db.finish_paper(pid, structure["title"] or p.get("filename") or "", path, structure)
+    _prefetch_domain_guess(pid, structure)
+
+
+def _parse_worker_loop() -> None:
+    while True:
+        pid = _parse_queue.get()
+        try:
+            _parse_one(pid)
+        except Exception as e:          # 兜底：任何意外都落到该论文的「解析失败」
+            try:
+                db.set_parse_error(pid, f"解析失败：{e}")
+            except Exception:
+                pass
+        finally:
+            _parse_queue.task_done()
+
+
+def _start_parse_worker() -> None:
+    """启动唯一的解析线程；同时把上次异常退出时卡在 parsing 的论文重新入队。"""
+    global _parse_worker
+    with _parse_worker_guard:
+        if _parse_worker is not None:
+            return
+        _parse_worker = threading.Thread(target=_parse_worker_loop,
+                                         name="paper-parse", daemon=True)
+        _parse_worker.start()
+        for p in db.list_papers():
+            if p.get("status") == "parsing":
+                _parse_queue.put(p["id"])
+
+
+def _enqueue_parse(pid: str) -> None:
+    _start_parse_worker()
+    _parse_queue.put(pid)
+
+
+_start_parse_worker()
 
 
 @app.post("/api/papers")
@@ -47,18 +167,45 @@ async def upload(file: UploadFile, folder_id: str = ""):
         raise HTTPException(400, "仅支持 PDF 文件")
     if folder_id and not db.get_folder(folder_id):
         raise HTTPException(404, "文件夹不存在")
-    pid = db.new_pending(file.filename, folder_id or None)
+    pid = db.new_paper_id()
     path = os.path.join(db.PDF_DIR, f"{pid}.pdf")
-    with open(path, "wb") as f:
-        f.write(await file.read())
+    # 分块落盘：大 PDF 不必整份读进内存；写失败时别留下半截文件
     try:
-        structure = pdf_parse.parse_pdf(path)
-    except Exception as e:
-        db.set_status(pid, "error")
-        raise HTTPException(422, f"PDF 解析失败: {e}")
-    db.finish_paper(pid, structure["title"] or file.filename, path, structure)
-    _prefetch_domain_guess(pid, structure)   # 后台预生成领域猜测，避免进论文时弹窗等待
+        with open(path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                f.write(chunk)
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    try:
+        db.new_pending(file.filename, folder_id or None, path, pid)
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    _enqueue_parse(pid)
     return {"id": pid}
+
+
+@app.post("/api/papers/{pid}/retry")
+def retry_paper(pid: str):
+    """失败论文重新解析：PDF 还在本地，不需要重新上传。"""
+    p = db.get_paper(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    if p.get("status") == "parsing":
+        return {"ok": True}
+    path = p.get("pdf_path") or os.path.join(db.PDF_DIR, f"{pid}.pdf")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "PDF 文件不存在，请重新上传")
+    db.mark_parsing(pid)
+    _enqueue_parse(pid)
+    return {"ok": True}
 
 
 @app.get("/api/papers")
@@ -142,16 +289,23 @@ def copy_paper_to_folder(pid: str, body: FolderTargetIn):
     src = db.get_paper(pid)
     if not src:
         raise HTTPException(404, "not found")
+    if src.get("status") != "parsed":
+        raise HTTPException(409, "论文还在解析中，解析完成后才能复制")
     if body.folder_id and not db.get_folder(body.folder_id):
         raise HTTPException(404, "文件夹不存在")
     src_pdf = src.get("pdf_path") or ""
     if not src_pdf or not os.path.exists(src_pdf):
-        raise HTTPException(422, "原论文 PDF 文件不存在，无法复制")
+        # 数据目录搬过家后旧库里存的是失效绝对路径，按 id 回数据目录找
+        guess = os.path.join(db.PDF_DIR, f"{pid}.pdf")
+        if not os.path.isfile(guess):
+            raise HTTPException(422, "原论文 PDF 文件不存在，无法复制")
+        src_pdf = guess
     new_pid = db.new_paper_id()
     new_pdf = os.path.join(db.PDF_DIR, f"{new_pid}.pdf")
     shutil.copy2(src_pdf, new_pdf)
     try:
-        db.copy_paper(pid, body.folder_id, new_pid, new_pdf)
+        if not db.copy_paper(pid, body.folder_id, new_pid, new_pdf):
+            raise HTTPException(404, "not found")
     except Exception:
         try:
             os.remove(new_pdf)
@@ -166,10 +320,13 @@ def paper(pid: str):
     p = db.get_paper(pid)
     if not p:
         raise HTTPException(404, "not found")
+    if pdf_parse.ensure_block_links(p["structure"]):   # 老论文：补跨页段落链接
+        db.set_structure(pid, p["structure"])
     p.pop("pdf_path", None)
-    if p.get("analysis"):
+    if isinstance(p.get("analysis"), dict):
         # 旧数据里术语可能没有 refs → 读取时按原文出现位置补齐，小卡才有锚点
-        summarize.locate_term_refs(p["analysis"].get("terms") or [], p["structure"])
+        if summarize.locate_term_refs(p["analysis"].get("terms") or [], p["structure"]):
+            db.save_analysis(pid, p["analysis"])   # 补齐后落库，别每次打开都重扫全文
     return p
 
 
@@ -193,6 +350,8 @@ def paper_tables(pid: str):
     if not p:
         raise HTTPException(404, "not found")
     if p["structure"].get("tables_version") == table_regions.TABLES_VERSION:
+        if pdf_parse.ensure_block_links(p["structure"]):
+            db.set_structure(pid, p["structure"])
         return {"tables": p["structure"].get("tables") or [],
                 "version": table_regions.TABLES_VERSION}
     path = p.get("pdf_path") or ""
@@ -205,12 +364,16 @@ def paper_tables(pid: str):
         p = db.get_paper(pid) or p
         st = p["structure"]
         if st.get("tables_version") == table_regions.TABLES_VERSION:
+            if pdf_parse.ensure_block_links(st):
+                db.set_structure(pid, st)
             return {"tables": st.get("tables") or [],
                     "version": table_regions.TABLES_VERSION}
         try:
             tables = table_regions.ensure_tables(st, path)
         except Exception as e:
             raise HTTPException(500, f"表格识别失败：{e}")
+        # 表格重标后可能改变块边界，跨页段落链接按新的 table_id 重算一次
+        pdf_parse.ensure_block_links(st, force=True)
         db.set_structure(pid, st)
         return {"tables": tables, "version": table_regions.TABLES_VERSION}
 
@@ -233,13 +396,17 @@ def pdf(pid: str):
 
 @app.delete("/api/papers/{pid}")
 def del_paper(pid: str):
-    path = db.delete_paper(pid)
-    if path is None:
+    p = db.get_paper(pid)
+    if not p:
         raise HTTPException(404, "not found")
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    db.delete_paper(pid)
+    for path in {p.get("pdf_path"), os.path.join(db.PDF_DIR, f"{pid}.pdf")}:
+        if not path:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     return {"ok": True}
 
 
@@ -248,15 +415,28 @@ def analyze(pid: str):
     p = db.get_paper(pid)
     if not p:
         raise HTTPException(404, "not found")
+    # 先确认模型配好：否则 summarize 会吞掉异常、用占位内容覆盖已有的好导读
+    llm.get_route("default")
     m = db.get_meta(pid) or {}
     # 有完整画像（摸底+阅读计划）→ 带个性化提示；否则手动路径不加任何特殊提示
     has_profile = bool(m.get("domain")) and bool(m.get("plan"))
     if has_profile:
-        plan = m.get("plan") or {}
+        plan = m.get("plan") if isinstance(m.get("plan"), dict) else {}
         analysis = summarize.analyze(p["structure"], m.get("known_terms") or [], plan,
                                      plan.get("term_depth"), m.get("familiarity"))
     else:
         analysis = summarize.analyze(p["structure"])
+    failed = set(analysis.pop("_failed", []) or [])
+    old = p.get("analysis") if isinstance(p.get("analysis"), dict) else {}
+    for key in failed:
+        if isinstance(old.get(key), list) and old[key]:
+            analysis[key] = old[key]      # 这一部分这次失败了：保留上次的结果
+    elements = analysis.get("elements") or []
+    if "elements" in failed and not (isinstance(old.get("elements"), list) and old["elements"]):
+        # 没有旧导读可保底，且六要素完全没生成出来 → 不写库，避免存下全占位内容
+        raise HTTPException(502, "导读生成失败，请检查模型设置或稍后重试")
+    if not elements:
+        raise HTTPException(502, "导读生成失败：模型没有返回可用的要素")
     db.save_analysis(pid, analysis)
     return analysis
 
@@ -266,8 +446,10 @@ def get_analysis(pid: str):
     p = db.get_paper(pid)
     if not p:
         raise HTTPException(404, "not found")
-    analysis = p["analysis"] or {"elements": [], "outlines": [], "terms": []}
-    summarize.locate_term_refs(analysis.get("terms") or [], p["structure"])
+    analysis = p["analysis"] if isinstance(p.get("analysis"), dict) else {}
+    analysis = analysis or {"elements": [], "outlines": [], "terms": []}
+    if summarize.locate_term_refs(analysis.get("terms") or [], p["structure"]):
+        db.save_analysis(pid, analysis)
     return analysis
 
 
@@ -285,6 +467,8 @@ class CardIn(BaseModel):
 
 @app.post("/api/papers/{pid}/cards")
 def add_card(pid: str, body: CardIn):
+    if not db.paper_exists(pid):
+        raise HTTPException(404, "not found")
     cid = db.add_card(pid, body.type, body.block_id, body.top, body.data)
     return {"id": cid}
 
@@ -386,6 +570,22 @@ def translate(pid: str, body: TranslateIn):
         raise HTTPException(422, str(e))
 
 
+class SelectionTranslateIn(BaseModel):
+    text: str
+    block_id: str = ""
+
+
+@app.post("/api/papers/{pid}/translate-selection")
+def translate_selection(pid: str, body: SelectionTranslateIn):
+    p = db.get_paper(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    try:
+        return ai.translate_selection(p["structure"], body.text, body.block_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
 class TermIn(BaseModel):
     term: str
     zh: str = ""
@@ -435,7 +635,7 @@ def get_paper_profile(pid: str):
         raise HTTPException(404, "not found")
     meta = db.get_meta(pid)
     guess = (meta or {}).get("domain_guess")
-    if not guess:                       # 后台还没跑完/旧数据 → 现算并缓存
+    if not isinstance(guess, dict) or not guess.get("domain"):  # 后台还没跑完/旧数据 → 现算并缓存
         guess = profile.guess_domain(p["structure"])
         db.upsert_meta(pid, domain_guess=guess)
         meta = db.get_meta(pid)
@@ -468,8 +668,14 @@ def make_plan(pid: str):
     if not p:
         raise HTTPException(404, "not found")
     m = db.get_meta(pid) or {}
-    plan = profile.make_plan(p["structure"], m.get("domain") or "", m.get("familiarity") or "新手",
-                             m.get("known_terms") or [])
+    try:
+        plan = profile.make_plan(p["structure"], m.get("domain") or "",
+                                 m.get("familiarity") or "新手",
+                                 m.get("known_terms") or [])
+    except llm.LLMNotConfigured:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"阅读计划生成失败：{e}")
     db.upsert_meta(pid, plan=plan)
     return plan
 
@@ -481,6 +687,8 @@ class PlanIn(BaseModel):
 @app.put("/api/papers/{pid}/plan")
 def save_plan(pid: str, body: PlanIn):
     """用户勾选调整后的计划落库。"""
+    if not db.paper_exists(pid):
+        raise HTTPException(404, "not found")
     m = db.upsert_meta(pid, plan=body.plan)
     return m
 
@@ -521,6 +729,8 @@ class CollectIn(BaseModel):
 
 @app.post("/api/papers/{pid}/collect")
 def collect(pid: str, body: CollectIn):
+    if not db.paper_exists(pid):
+        raise HTTPException(404, "not found")
     m = db.set_collected(pid, body.collected)
     return {"collected": m.get("collected") if m else 0}
 
@@ -531,8 +741,7 @@ class NoteIn(BaseModel):
 
 @app.post("/api/papers/{pid}/note")
 def set_note(pid: str, body: NoteIn):
-    p = db.get_paper(pid)
-    if not p:
+    if not db.paper_exists(pid):
         raise HTTPException(404, "not found")
     m = db.set_note(pid, body.note.strip())
     return {"note": m.get("note") if m else ""}
@@ -542,18 +751,23 @@ class DismissTermIn(BaseModel):
     term: str
 
 
+_dismiss_lock = threading.Lock()
+
+
 @app.post("/api/papers/{pid}/dismiss_term")
 def dismiss_term(pid: str, body: DismissTermIn):
     """删除术语小卡：记录已隐藏的术语，刷新后不再出现。"""
-    p = db.get_paper(pid)
-    if not p:
+    if not db.paper_exists(pid):
         raise HTTPException(404, "not found")
-    m = db.get_meta(pid) or {}
-    cur = list(m.get("dismissed_terms") or [])
-    t = body.term.strip()
-    if t and t not in cur:
-        cur.append(t)
-    db.upsert_meta(pid, dismissed_terms=cur)
+    # 读-改-写要串行，否则两个标签页同时隐藏术语会丢掉其中一个
+    with _dismiss_lock:
+        m = db.get_meta(pid) or {}
+        raw = m.get("dismissed_terms")
+        cur = list(raw) if isinstance(raw, list) else []
+        t = body.term.strip()
+        if t and t not in cur:
+            cur.append(t)
+        db.upsert_meta(pid, dismissed_terms=cur)
     return {"dismissed_terms": cur}
 
 
@@ -574,9 +788,9 @@ def recommend(pid: str):
         hist_rows = [r for r in rows if r.get("folder_id") == folder_id]
         if hist_rows:
             scope = "folder"
-    domain = (m.get("domain") or "").strip()
+    domain = str(m.get("domain") or "").strip()
     if not hist_rows and domain:
-        hist_rows = [r for r in rows if (r.get("domain") or "").strip() == domain]
+        hist_rows = [r for r in rows if str(r.get("domain") or "").strip() == domain]
         if hist_rows:
             scope = "domain"
 
@@ -591,10 +805,15 @@ def recommend(pid: str):
     history = []
     for row in hist_rows[:20]:
         mm = db.get_meta(row["id"]) or {}
-        asked = [c["data"].get("messages", [{}])[0].get("content", "")
-                 for c in db.list_cards(row["id"]) if c["type"] == "chat"]
+        asked = []
+        for c in db.list_cards(row["id"]):
+            if c["type"] != "chat":
+                continue
+            msgs = c["data"].get("messages") or []
+            if msgs and isinstance(msgs[0], dict) and msgs[0].get("content"):
+                asked.append(msgs[0]["content"])
         history.append({"title": row["title"] or row["filename"],
-                        "domain": mm.get("domain"), "asked": [a for a in asked if a]})
+                        "domain": mm.get("domain"), "asked": asked})
 
     queries = profile.recommend_queries(
         p["structure"],
@@ -643,23 +862,33 @@ def recommend(pid: str):
 
 
 class ReviewIn(BaseModel):
-    paper_ids: list[str] = []     # 为空则用全部收藏论文
+    paper_ids: list[str] = []     # 为空则用全部收藏论文（仍需已生成导读）
 
 
 @app.post("/api/review")
 def make_review(body: ReviewIn | None = None):
     ids = (body.paper_ids if body else None) or [r["id"] for r in db.list_collected()]
+    ids = list(dict.fromkeys(ids))
     papers = []
+    missing = []
     for pid in ids:
         p = db.get_paper(pid)
-        if p:
-            m = db.get_meta(pid) or {}
-            plan = m.get("plan") or {}
-            papers.append({"title": p["title"] or p["filename"],
-                           "analysis": p["analysis"], "domain": m.get("domain"),
-                           "focus": plan.get("focus"), "skip": plan.get("skip")})
+        if not p:
+            continue
+        analysis = p.get("analysis") if isinstance(p.get("analysis"), dict) else {}
+        if not analysis.get("elements"):
+            missing.append(p["title"] or p["filename"])
+            continue
+        m = db.get_meta(pid) or {}
+        plan = m.get("plan") if isinstance(m.get("plan"), dict) else {}
+        papers.append({"title": p["title"] or p["filename"],
+                       "analysis": analysis, "domain": m.get("domain"),
+                       "focus": plan.get("focus"), "skip": plan.get("skip")})
+    if missing:
+        raise HTTPException(400, "以下论文还没有生成导读，无法纳入综述："
+                            + "、".join(missing[:5]) + ("…" if len(missing) > 5 else ""))
     if len(papers) < 2:
-        raise HTTPException(400, "至少选择 2 篇论文才能生成综述")
+        raise HTTPException(400, "至少选择 2 篇已生成导读的论文才能生成综述")
     return profile.review(papers)
 
 
@@ -668,7 +897,7 @@ def make_review(body: ReviewIn | None = None):
 @app.get("/api/papers/{pid}/quiz")
 def read_quiz(pid: str):
     """上次做的自测（题目+作答+判分结果），供重新打开面板时还原。"""
-    if not db.get_paper(pid):
+    if not db.paper_exists(pid):
         raise HTTPException(404, "not found")
     return {"quiz": (db.get_meta(pid) or {}).get("quiz")}
 
@@ -711,8 +940,10 @@ class QuizAnswersIn(BaseModel):
 @app.post("/api/papers/{pid}/quiz/answers")
 def save_quiz_answers(pid: str, body: QuizAnswersIn):
     """保存未提交的作答，下次打开面板接着做。"""
+    if not db.paper_exists(pid):
+        raise HTTPException(404, "not found")
     qz = (db.get_meta(pid) or {}).get("quiz")
-    if not qz:
+    if not isinstance(qz, dict):
         return {"ok": False}
     db.upsert_meta(pid, quiz={**qz, "answers": body.answers})
     return {"ok": True}
@@ -950,15 +1181,22 @@ def sync_provider_models(pid: str):
         ids = [m["id"] for m in model_catalog.models(p.get("catalog_id"))]
 
     prev = p.get("models") or {}
+    if not ids:
+        # 实时列表和目录都拿不到（常见于本地服务未启动）→ 保留上次结果，
+        # 不要用空列表把界面上的模型全部清掉。
+        return _models_payload(p, prev.get("available") or [], prev.get("enabled") or [],
+                               prev.get("source") or source, error or "没有获取到模型列表")
+    if source != "api":
+        # 目录只是回落数据，可能缺用户手动启用的模型：把它们补回来，避免同步一次就丢勾选。
+        ids = ids + [m for m in (prev.get("enabled") or []) if m not in ids]
     enabled = [m for m in (prev.get("enabled") or []) if m in ids]
     if not enabled:
         want = {(r.get("model") or "") for r in _routes_raw().values()}
         enabled = [m for m in ids if m in want]
     if not enabled:
         enabled = [m for m in ids if _looks_chat(m)][:20]
-    if ids:
-        db.update_provider(pid, models={"available": ids, "enabled": enabled,
-                                        "fetched_at": time.time(), "source": source})
+    db.update_provider(pid, models={"available": ids, "enabled": enabled,
+                                    "fetched_at": time.time(), "source": source})
     p = db.get_provider(pid)
     return _models_payload(p, ids, enabled, source, error)
 

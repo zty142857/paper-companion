@@ -3,8 +3,22 @@ import json
 import re
 
 from . import llm, search
+from .textblocks import blocks_for_ids, logical_blocks, page_label, paragraph_index
 
 CTX_CAP = 6000
+
+
+def _text(value) -> str:
+    """模型字段可能是对象/数组：统一转成可安全渲染的字符串。"""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 # 回答正文里的节号引用：[s20] / [s20, s21] / [s18-s26]（含全角横线）。
 # s 编号不是块ID，服务端展开为对应页码后从正文清洗
 SEC_CITE_RE = re.compile(r"\[(?=[^\]]*\bs\d+\b)[^\]]*\]")
@@ -23,29 +37,32 @@ def _looks_external(q: str) -> bool:
 
 def _context(structure: dict, block_ids: list[str]) -> str:
     blocks = {b["id"]: b for b in structure["blocks"]}
+    index = paragraph_index(structure)
     sec = {s["id"]: s["title"] for s in structure["sections"]}
     ids = [i for i in block_ids if i in blocks]
     if not ids:
         return ""
-    # 附带同节相邻块，补足上下文
-    first = blocks[ids[0]]
-    same = [b for b in structure["blocks"]
+    # 跨页段落按逻辑段落取：锚在页末/页首都能拿到完整的一段
+    first = index.get(ids[0]) or blocks[ids[0]]
+    same = [b for b in logical_blocks(structure)
             if b["section_id"] == first["section_id"]
             and b["type"] not in ("figure",)
             and not b.get("table_id")]
     if not same:
         return ""
     try:
-        lo = next(i for i, b in enumerate(same) if b["id"] == ids[0])
+        lo = next(i for i, b in enumerate(same) if b["id"] == first["id"])
     except StopIteration:          # 锚点本身落在表内（老卡片）→ 从本节开头取
         lo = 0
     lo = min(lo, len(same) - 1)
     window = same[max(0, lo - 1): lo + 6]
-    picked = [b for b in window if b["id"] in ids] + [b for b in window if b["id"] not in ids]
+    picked_ids = {b["id"] for b in blocks_for_ids(structure, ids)}
+    picked = ([b for b in window if b["id"] in picked_ids]
+              + [b for b in window if b["id"] not in picked_ids])
     lines, used = [], 0
     for b in picked:
         t = b["text"][:1200]
-        line = f"[{b['id']}|第{b['page']}页|{sec.get(b['section_id'], '')}] {t}"
+        line = f"[{b['id']}|{page_label(b)}|{sec.get(b['section_id'], '')}] {t}"
         if used + len(line) > CTX_CAP:
             break
         lines.append(line)
@@ -76,8 +93,12 @@ def _global_ctx(structure: dict, analysis: dict | None) -> str:
     （六要素 + 每节一句话概要，零额外 LLM 调用）；没做过导读则退化为论文开头几段。
     修的是旧行为——此时 ctx 为空串，模型只拿得到标题，只能拒答或编造。"""
     parts = []
-    els = (analysis or {}).get("elements") or []
-    outs = (analysis or {}).get("outlines") or []
+    if not isinstance(analysis, dict):
+        analysis = {}
+    raw_els = analysis.get("elements")
+    raw_outs = analysis.get("outlines")
+    els = [e for e in raw_els if isinstance(e, dict)] if isinstance(raw_els, list) else []
+    outs = [o for o in raw_outs if isinstance(o, dict)] if isinstance(raw_outs, list) else []
     if els:
         parts.append("【全文导读】\n" + "\n".join(f"- {e.get('kind')}：{e.get('text')}" for e in els))
     if outs:
@@ -86,7 +107,7 @@ def _global_ctx(structure: dict, analysis: dict | None) -> str:
             f"- {sec_title.get(o.get('section_id'), '')}：{o.get('outline')}"
             for o in outs if o.get("outline")))
     if not parts:
-        paras = [b["text"][:600] for b in structure["blocks"]
+        paras = [b["text"][:600] for b in logical_blocks(structure)
                  if b["type"] == "para" and len(b["text"]) > 80][:4]
         parts.append("【论文开头（尚未生成全文导读，以下仅据开头与目录作答）】\n" + "\n\n".join(paras))
     return "\n\n".join(parts)
@@ -231,8 +252,8 @@ def explain_term(structure: dict, term: str, zh: str = "", refs: list[str] | Non
     if not term:
         raise ValueError("术语为空")
     blocks = {b["id"]: b for b in structure["blocks"]}
-    ctx_blocks = [blocks[r] for r in (refs or []) if r in blocks][:3]
-    ctx = "\n".join(f"[{b['id']}|第{b['page']}页] {b['text'][:500]}" for b in ctx_blocks)
+    ctx_blocks = blocks_for_ids(structure, refs or [])[:3]
+    ctx = "\n".join(f"[{b['id']}|{page_label(b)}] {b['text'][:500]}" for b in ctx_blocks)
     paper_title = structure.get("title", "")
     depth_hint = _TERM_DEPTH_HINT.get(term_depth, _TERM_DEPTH_HINT["normal"])
     prompt = f"""论文《{paper_title}》中出现了一个术语：**{term}**{f'（中文常译：{zh}）' if zh else ''}。
@@ -243,18 +264,22 @@ def explain_term(structure: dict, term: str, zh: str = "", refs: list[str] | Non
 {ctx or '（无具体语境，请给出该领域的通用解释）'}"""
     data = llm.chat_json(prompt, "你是论文术语讲解助手，解释要通俗且贴合论文语境。")
     valid = {b["id"] for b in structure["blocks"]}
-    out_refs = [r for r in data.get("refs", []) if r in valid] or [r for r in (refs or []) if r in valid]
+    out_refs = [r for r in (data.get("refs") or []) if isinstance(r, str) and r in valid] \
+        or [r for r in (refs or []) if r in valid]
     pages = sorted({blocks[r]["page"] for r in out_refs})[:3]
-    return {"term": term, "zh": data.get("zh") or zh or "",
-            "expl": data.get("expl") or "（生成失败，请重试）",
+    return {"term": term, "zh": _text(data.get("zh")) or zh or "",
+            "expl": _text(data.get("expl")) or "（生成失败，请重试）",
             "refs": out_refs, "pages": pages}
 
 
 def _neighbors(structure: dict, block_id: str):
-    """返回 (上一块, 下一块)：按块 id 数值序（≈文档顺序），跳过 figure/formula 与空块。"""
-    order = sorted(structure["blocks"], key=lambda b: int(b["id"][1:]))
-    idx = {b["id"]: i for i, b in enumerate(order)}
-    i = idx.get(block_id)
+    """返回 (上一段, 下一段)：按逻辑段落（跨页合并后）取，跳过 figure/formula 与空块。"""
+    order = sorted(logical_blocks(structure), key=_bid_num)
+    index = paragraph_index(structure)
+    target = index.get(block_id)
+    if target is None:
+        return None, None
+    i = next((j for j, b in enumerate(order) if b["id"] == target["id"]), None)
     if i is None:
         return None, None
     prev = next((order[j] for j in range(i - 1, -1, -1)
@@ -266,15 +291,91 @@ def _neighbors(structure: dict, block_id: str):
     return prev, nxt
 
 
+def _norm_match(s: str) -> str:
+    """选区与块文本的宽松归一化：忽略大小写、连字符断词、标点与多余空白。"""
+    s = (s or "").lower().replace("\u00ad", "")
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", s).strip()
+
+
+def _locate_block(structure: dict, text: str) -> dict | None:
+    """按选区文字反查所在块。选区通常只是块的一部分，按“整串→前缀→首词”逐级放宽。"""
+    target = _norm_match(text)[:600]
+    if not target:
+        return None
+    cands = [b for b in structure.get("blocks") or []
+             if b.get("type") in ("para", "heading") and (b.get("text") or "").strip()]
+    bodies = [(b, _norm_match(b["text"])) for b in cands]
+    bodies = [(b, body) for b, body in bodies if body]
+
+    def pick(hits):
+        # 多个块都含同一片段时，取最短的（最贴合选区所在段）
+        return min(hits, key=lambda x: len(x[1]))[0]
+
+    for n in (len(target), 120, 80, 40):
+        head = target[:n]
+        if len(head) < 12:
+            continue
+        hits = [(b, body) for b, body in bodies if head in body]
+        if hits:
+            return pick(hits)
+    return None
+
+
+def translate_selection(structure: dict, text: str, block_id: str = "") -> dict:
+    """划词翻译：只翻译选中的文字，用所在段落与前后文帮助理解指代。"""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("选中的内容为空")
+    if len(text) > 3000:
+        text = text[:3000]
+    blocks = {b["id"]: b for b in structure["blocks"]}
+    b = blocks.get(block_id) if block_id else None
+    if b is None:
+        b = _locate_block(structure, text)
+    lb = paragraph_index(structure).get(b["id"]) if b else None
+    sec = ""
+    if lb:
+        sec = next((s["title"] for s in structure["sections"] if s["id"] == lb["section_id"]), "")
+    prev, nxt = _neighbors(structure, b["id"]) if b else (None, None)
+    origin = "；".join(x for x in (
+        f"论文标题：{structure.get('title', '')}" if structure.get("title") else "",
+        f"所在章节：{sec}" if sec else "") if x)
+    ctx_lines = []
+    if prev:
+        ctx_lines.append(f"上文（仅供理解指代，勿翻译）：{prev['text'][-250:]}")
+    if lb:
+        ctx_lines.append(f"所在段落（仅供理解，勿整段翻译）：{lb['text'][:1200]}")
+    if nxt:
+        ctx_lines.append(f"下文（勿翻译）：{nxt['text'][:150]}")
+    ctx = "\n".join(ctx_lines)
+    prompt = f"""把下面这段从英文学术论文中选中的文字翻译成简体中文。
+{origin + chr(10) if origin else ''}要求：
+- 忠实、通顺，专业术语首次出现时保留英文并在括号中给中文；公式符号（如 $R$, q_12）原样保留。
+- 选中内容可能只是一个词、短语或半句话：给出最贴合上下文的简体中文释义；必要时用 1~2 句补充说明，不要展开成长篇解释。
+- 只翻译「选中片段」；上下文仅用于理解 this/these/上述 等指代，**不得出现在译文里**。
+- 若选中片段以公式符号为主、无法有效翻译，返回 {{"error": "该片段以公式符号为主，无法有效翻译"}}。
+只输出 JSON：{{"translation": "..."}}
+
+{ctx + chr(10) if ctx else ''}选中片段：
+{text}"""
+    data = llm.chat_json(prompt, "你是学术翻译。", purpose="translate")
+    return {"translation": _text(data.get("translation")) or _text(data.get("error"))
+            or "（模型未返回译文，请重试）",
+            "block_id": b["id"] if b else "",
+            "page": b["page"] if b else 0}
+
+
 def translate(structure: dict, block_id: str) -> dict:
     blocks = {b["id"]: b for b in structure["blocks"]}
     b = blocks.get(block_id)
-    if not b or not b["text"].strip():
+    lb = paragraph_index(structure).get(block_id) or b
+    if not b or not lb or not lb["text"].strip():
         raise ValueError("该块没有可翻译的文本（可能是图片或公式，可改用「问这段」）")
-    sec = next((s["title"] for s in structure["sections"] if s["id"] == b["section_id"]), "")
+    text = lb["text"]
+    sec = next((s["title"] for s in structure["sections"] if s["id"] == lb["section_id"]), "")
     prev, nxt = _neighbors(structure, block_id)
-    # 本块结尾没有句末标点 → 句子被块边界截断，附下文首句帮助理解（不混进译文）
-    cut_mid = not re.search(r"[.!?;:]\s*$", b["text"])
+    # 本段结尾没有句末标点 → 句子被块边界截断，附下文首句帮助理解（不混进译文）
+    cut_mid = not re.search(r"[.!?;:]\s*$", text)
     ctx_prev = f"上文（仅供理解指代，勿翻译）：{prev['text'][-250:]}\n" if prev else ""
     ctx_next = f"下文（勿翻译）：{nxt['text'][:150]}\n" if (nxt and cut_mid) else ""
     origin = "；".join(x for x in (f"论文标题：{structure.get('title', '')}" if structure.get("title") else "",
@@ -287,11 +388,12 @@ def translate(structure: dict, block_id: str) -> dict:
 只输出 JSON：{{"translation": "..."}}
 
 {ctx_prev}原文片段：
-{b['text']}
+{text}
 {ctx_next}"""
     data = llm.chat_json(prompt, "你是学术翻译。", purpose="translate")
-    return {"translation": data.get("translation") or data.get("error", ""),
-            "block_id": block_id, "page": b["page"]}
+    return {"translation": _text(data.get("translation")) or _text(data.get("error"))
+            or "（模型未返回译文，请重试）",
+            "block_id": block_id, "page": b["page"], "text": text}
 
 
 def chat(structure: dict, block_ids: list[str], history: list[dict], question: str,
@@ -362,8 +464,8 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
 输出 JSON：{{"answer": "回答正文，含 [块ID] 引用", "refs": ["用到的块ID"]}}"""
     data = llm.chat_json(prompt, sys)
     valid = {b["id"] for b in structure["blocks"]}
-    refs = [r for r in data.get("refs", []) if r in valid]
-    answer = data.get("answer", "（生成失败，请重试）")
+    refs = [r for r in (data.get("refs") or []) if isinstance(r, str) and r in valid]
+    answer = _text(data.get("answer")) or "（生成失败，请重试）"
     extra_pages: set[int] = set()
     # 模型在全篇问答里爱用 [s20]/[s18-s26] 引节号：展开为页码（可跳转），并从正文剔除噪声
     sec_pages = {s["id"]: s["page"] for s in structure["sections"]}

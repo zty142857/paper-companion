@@ -35,7 +35,8 @@ function effortChoices(info: ModelInfo | null, current: string) {
   } else if (toggle) {
     out.push({ value: 'on', label: '开启思考' })
     out.push({ value: 'none', label: '关闭思考' })
-  } else if (info && !info.known) {
+  } else if (!info || !info.known) {
+    // 目录未收录 / 元数据接口失败时也给出手填档位，避免只能选「自动」
     for (const v of ['none', 'low', 'medium', 'high']) {
       out.push({ value: v, label: `${EFFORT_LABEL[v]}（未验证）` })
     }
@@ -65,7 +66,7 @@ function EffortSelect({ providerId, model, value, onChange }: {
   const loading = !!providerId && !!model && loaded?.key !== key
   const probeText = probe?.key === key ? probe.text : ''
   const choices = effortChoices(info, value)
-  const unknown = info && !info.known
+  const unknown = !loading && !!providerId && !!model && (!info || !info.known)
   const probeLevels = (info?.reasoning_options.find((o) => o.type === 'effort')?.values || [])
     .filter((v) => v !== 'none')
 
@@ -201,7 +202,14 @@ function ProvidersPanel({ providers, onReload, onError }: {
   useEffect(() => {
     setRows(null)
     if (!cur?.id) return
-    api.providerModels(cur.id).then(setRows).catch(() => setRows(null))
+    let alive = true
+    const reqId = cur.id
+    api.providerModels(reqId).then((r) => {
+      if (alive && cur?.id === reqId) setRows(r)
+    }).catch(() => {
+      if (alive && cur?.id === reqId) setRows(null)
+    })
+    return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cur?.id])
 
@@ -379,7 +387,7 @@ function ProvidersPanel({ providers, onReload, onError }: {
         {side}
         <div className="provider-detail">
           <div className="detail-head"><b>添加提供商</b></div>
-          <label>从内置目录选择（205 家 OpenAI 兼容服务）</label>
+          <label>从内置目录选择（{presets.length || '200+'} 家 OpenAI 兼容服务）</label>
           <select value={presetId} onChange={(e) => pickPreset(e.target.value)}>
             <option value="">自定义（手动填写地址）</option>
             <optgroup label="本地服务">

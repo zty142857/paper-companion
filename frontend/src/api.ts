@@ -30,7 +30,7 @@ export interface TableBox {
   source?: string
 }
 /** 表格抽取规则版本：老论文没有这个版本号时，前端打开会调 /tables 懒补 */
-export const TABLES_VERSION = 2
+export const TABLES_VERSION = 3
 export interface Structure {
   title: string; pages: number; blocks: Block[]; sections: Section[]
   /** 后端版面模型给出的整条公式框（1.0 解析器新增；老论文没有这个字段） */
@@ -41,6 +41,8 @@ export interface Structure {
 export interface Paper {
   id: string; title: string; filename: string; pages: number
   structure: Structure; analysis: Analysis | null; status: string
+  parse_error?: string | null
+  has_analysis?: number
   visited?: number; collected?: number; domain?: string | null; note?: string | null
   folder_id?: string | null; folder_name?: string | null
 }
@@ -148,7 +150,15 @@ export interface QuizGrade { results: QuizResult[]; score: number; total: number
 export interface QuizSaved { questions: QuizQuestion[]; answers?: string[]; grade?: QuizGrade | null }
 
 const j = async (r: Response) => {
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText)
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}))
+    const detail = body?.detail
+    // FastAPI 的 422 校验错误是数组，直接放进 Error 会变成 [object Object]
+    const message = Array.isArray(detail)
+      ? detail.map((d: any) => d?.msg || '').filter(Boolean).join('；')
+      : detail
+    throw new Error(message || r.statusText)
+  }
   return r.json()
 }
 export const api = {
@@ -160,6 +170,8 @@ export const api = {
     const q = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''
     return fetch(`/api/papers${q}`, { method: 'POST', body: fd }).then(j)
   },
+  retryPaper: (id: string): Promise<{ ok: boolean }> =>
+    fetch(`/api/papers/${id}/retry`, { method: 'POST' }).then(j),
   folders: (): Promise<Folder[]> => fetch('/api/folders').then(j),
   addFolder: (name: string): Promise<{ id: string; name: string }> =>
     fetch('/api/folders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) }).then(j),
@@ -209,8 +221,11 @@ export const api = {
   delCard: (cid: string): Promise<any> => fetch(`/api/cards/${cid}`, { method: 'DELETE' }).then(j),
   tables: (pid: string): Promise<{ tables: TableBox[]; version: number }> =>
     fetch(`/api/papers/${pid}/tables`).then(j),
-  translate: (pid: string, block_id: string): Promise<{ translation: string; page: number }> =>
+  translate: (pid: string, block_id: string): Promise<{ translation: string; page: number; text?: string }> =>
     fetch(`/api/papers/${pid}/translate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id }) }).then(j),
+  translateSelection: (pid: string, body: { text: string; block_id?: string }):
+    Promise<{ translation: string; block_id: string; page: number }> =>
+    fetch(`/api/papers/${pid}/translate-selection`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
   explainTerm: (pid: string, body: { term: string; zh?: string; refs?: string[] }):
     Promise<{ term: string; zh: string; expl: string; refs: string[]; pages: number[] }> =>
     fetch(`/api/papers/${pid}/term`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),

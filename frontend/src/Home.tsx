@@ -9,7 +9,8 @@ type Placement = { paper: Paper; mode: 'move' | 'copy' }
 export default function Home() {
   const [papers, setPapers] = useState<Paper[]>([])
   const [folders, setFolders] = useState<Folder[]>([])
-  const [busy, setBusy] = useState('')
+  const [uploading, setUploading] = useState<{ done: number; total: number; current: string } | null>(null)
+  const [notice, setNotice] = useState('')
   const [err, setErr] = useState('')
   const [over, setOver] = useState(false)
   const [settings, setSettings] = useState(false)
@@ -28,6 +29,8 @@ export default function Home() {
   const [menuFor, setMenuFor] = useState<string | null>(null)
   const [placement, setPlacement] = useState<Placement | null>(null)
   const [folderBusy, setFolderBusy] = useState(false)
+  const readyPapers = papers.filter((p) => p.status === 'parsed')
+  const reviewablePapers = readyPapers.filter((p) => p.has_analysis)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const load = () => {
@@ -36,6 +39,16 @@ export default function Home() {
       .catch((e) => setErr(String(e)))
   }
   useEffect(() => { load() }, [])
+
+  // 后台解析期间每 2 秒刷新列表；全部完成/失败后自动停止
+  const parsing = papers.some((p) => p.status === 'parsing')
+  useEffect(() => {
+    if (!parsing) return
+    const timer = window.setInterval(() => {
+      api.list().then(setPapers).catch(() => {})
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [parsing])
 
   // 点击空白处收起论文行菜单
   useEffect(() => {
@@ -47,13 +60,38 @@ export default function Home() {
     return () => removeEventListener('mousedown', close)
   }, [menuFor])
 
-  const upload = async (f: File) => {
-    setBusy('解析中…'); setErr('')
+  const upload = async (picked: File[]) => {
+    const files = picked.filter((f) => f.name.toLowerCase().endsWith('.pdf'))
+    if (!files.length) { setErr('请选择 PDF 文件'); return }
+    const skipped = picked.length - files.length
+    setErr(skipped ? `已忽略 ${skipped} 个非 PDF 文件` : '')
+    setNotice('')
+    const target = activeFolder !== 'all' && activeFolder !== 'none' ? activeFolder : undefined
+    const failed: string[] = []
+    for (let i = 0; i < files.length; i++) {
+      setUploading({ done: i, total: files.length, current: files[i].name })
+      try {
+        await api.upload(files[i], target)
+      } catch (e: any) {
+        failed.push(`${files[i].name}：${e?.message || e}`)
+      }
+    }
+    setUploading(null)
+    load()
+    if (failed.length) {
+      setErr(`有 ${failed.length} 篇上传失败：${failed.slice(0, 3).join('；')}${failed.length > 3 ? '…' : ''}`)
+    } else {
+      setNotice(`已添加 ${files.length} 篇论文，正在后台解析，完成后不会自动打开。`)
+    }
+  }
+
+  const retryPaper = async (p: Paper) => {
+    setErr('')
     try {
-      const target = activeFolder !== 'all' && activeFolder !== 'none' ? activeFolder : undefined
-      const { id } = await api.upload(f, target)
-      location.hash = `#/paper/${id}`
-    } catch (e: any) { setErr(`上传失败：${e?.message || e}`); setBusy('') }
+      await api.retryPaper(p.id)
+      setPapers((ps) => ps.map((x) => x.id === p.id
+        ? { ...x, status: 'parsing', parse_error: null } : x))
+    } catch (e: any) { setErr(`重试失败：${e?.message || e}`) }
   }
 
   const startNote = (p: Paper, e: React.MouseEvent) => {
@@ -67,15 +105,20 @@ export default function Home() {
   }
 
   const openReview = () => {
-    setReviewText(null); setSelIds(papers.filter((p) => p.collected).map((p) => p.id)); setReviewOpen(true)
+    setReviewText(null)
+    setSelIds(readyPapers.filter((p) => p.collected && p.has_analysis).map((p) => p.id))
+    setReviewOpen(true)
   }
   const toggleSel = (pid: string) =>
     setSelIds((s) => s.includes(pid) ? s.filter((x) => x !== pid) : [...s, pid])
   const genReview = async () => {
     if (selIds.length < 2) return
     setReviewBusy(true); setErr('')
-    try { setReviewText((await api.review(selIds)).review) }
-    catch (e: any) { setErr(`综述生成失败：${e?.message || e}`) }
+    try {
+      const text = (await api.review(selIds)).review
+      if (!text?.trim()) setErr('综述生成失败：模型没有返回内容，请重试')
+      else setReviewText(text)
+    } catch (e: any) { setErr(`综述生成失败：${e?.message || e}`) }
     finally { setReviewBusy(false) }
   }
   const doClear = async () => {
@@ -143,7 +186,7 @@ export default function Home() {
       <div className="home-head">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <h1 style={{ flex: 1 }}>论文阅读学伴</h1>
-          {papers.length >= 2 && <button className="btn" onClick={openReview}>文献综述</button>}
+          {reviewablePapers.length >= 2 && <button className="btn" onClick={openReview}>文献综述</button>}
           <button className="btn" onClick={() => setPrivacyOpen(true)}>隐私与数据</button>
           <button className="btn" onClick={() => setSettings(true)}>模型设置</button>
         </div>
@@ -202,17 +245,26 @@ export default function Home() {
 
         <main className="home-main">
           <div className={`drop${over ? ' on' : ''}`}
-            onClick={() => fileRef.current?.click()}
-            onDragOver={(e) => { e.preventDefault(); setOver(true) }}
+            onClick={() => { if (!uploading) fileRef.current?.click() }}
+            onDragOver={(e) => { e.preventDefault(); if (!uploading) setOver(true) }}
             onDragLeave={() => setOver(false)}
-            onDrop={(e) => { e.preventDefault(); setOver(false); const f = e.dataTransfer.files[0]; if (f) upload(f) }}>
-            {busy || <><b>点击或拖拽 PDF 到此处</b><br />
+            onDrop={(e) => {
+              e.preventDefault(); setOver(false)
+              if (!uploading) upload(Array.from(e.dataTransfer.files))
+            }}>
+            {uploading ? <><b>正在上传 {uploading.done + 1}/{uploading.total}</b><br />
+              {uploading.current}</> : <><b>点击或拖拽 PDF 到此处</b><br />
               {activeFolder !== 'all' && activeFolder !== 'none'
-                ? <>将归入文件夹「{folderName}」</>
-                : '只支持英文/中文学术论文 PDF，解析约 5–15 秒'}</>}
-            <input ref={fileRef} type="file" accept="application/pdf" hidden
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) upload(f) }} />
+                ? <>将归入文件夹「{folderName}」；支持一次选择/拖入多篇</>
+                : '支持一次选择/拖入多篇，解析在后台进行，完成后不会自动打开'}</>}
+            <input ref={fileRef} type="file" accept="application/pdf" multiple hidden
+              onChange={(e) => {
+                const fs = Array.from(e.target.files || [])
+                e.target.value = ''
+                if (fs.length) upload(fs)
+              }} />
           </div>
+          {notice && <div className="hint" style={{ color: '#2e9e5b', marginBottom: 14 }}>{notice}</div>}
           {err && <div className="err" style={{ marginBottom: 14 }}>{err}</div>}
           {papers.length > 0 && (
             <h3 style={{ fontSize: 13, color: 'var(--muted)', margin: '16px 0 8px' }}>
@@ -222,12 +274,24 @@ export default function Home() {
           <div className="papers">
             {visiblePapers.map((p) => (
               <div className="paper-row" key={p.id}>
-                <a className="t" href={`#/paper/${p.id}`}>{p.title || p.filename}</a>
+                {p.status === 'parsed'
+                  ? <a className="t" href={`#/paper/${p.id}`}>{p.title || p.filename}</a>
+                  : <span className="t" style={{ opacity: .72 }} title={p.parse_error || undefined}>
+                    {p.title || p.filename}</span>}
                 {p.folder_name && (
                   <span className="badge folder-badge" title={`文件夹：${p.folder_name}`}>📁 {p.folder_name}</span>
                 )}
-                <span className="m">{p.pages} 页</span>
-                <span className="badge">{p.status === 'parsed' ? '已解析' : p.status}</span>
+                {p.status === 'parsed' && <span className="m">{p.pages} 页</span>}
+                <span className={`badge${p.status === 'error' ? ' error' : ''}`} title={p.parse_error || undefined}>
+                  {p.status === 'parsed' ? '已解析'
+                    : p.status === 'parsing' ? '解析中…'
+                      : p.status === 'error' ? '解析失败' : p.status}
+                </span>
+                {p.status === 'error' && (
+                  <button className="btn small" title={p.parse_error || '重新解析'} onClick={(e) => {
+                    e.preventDefault(); e.stopPropagation(); retryPaper(p)
+                  }}>重试</button>
+                )}
                 <button className="btn small" title="删除论文" onClick={(e) => {
                   e.preventDefault(); e.stopPropagation()
                   if (confirm(`删除《${p.title || p.filename}》？相关卡片、笔记与标亮也会一并删除。`)) {
@@ -242,16 +306,18 @@ export default function Home() {
                     onKeyDown={(e) => { if (e.key === 'Enter') saveNote(p.id); if (e.key === 'Escape') setEditNote(null) }} />
                   : <button className="note-view" onClick={(e) => startNote(p, e)} title="点击编辑备注">
                     {p.note ? `📝 ${p.note}` : '＋ 备注'}</button>}
-                <div className="paper-menu">
-                  <button className="btn small" title="更多操作"
-                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuFor(menuFor === p.id ? null : p.id) }}>⋯</button>
-                  {menuFor === p.id && (
-                    <div className="paper-menu-pop" onClick={(e) => e.stopPropagation()}>
-                      <button onClick={() => { setPlacement({ paper: p, mode: 'move' }); setMenuFor(null) }}>移动到文件夹…</button>
-                      <button onClick={() => { setPlacement({ paper: p, mode: 'copy' }); setMenuFor(null) }}>复制到文件夹…</button>
-                    </div>
-                  )}
-                </div>
+                {p.status === 'parsed' && (
+                  <div className="paper-menu">
+                    <button className="btn small" title="更多操作"
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuFor(menuFor === p.id ? null : p.id) }}>⋯</button>
+                    {menuFor === p.id && (
+                      <div className="paper-menu-pop" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => { setPlacement({ paper: p, mode: 'move' }); setMenuFor(null) }}>移动到文件夹…</button>
+                        <button onClick={() => { setPlacement({ paper: p, mode: 'copy' }); setMenuFor(null) }}>复制到文件夹…</button>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
             {!visiblePapers.length && papers.length > 0 && (
@@ -269,11 +335,14 @@ export default function Home() {
               勾选要纳入综述的论文（至少 2 篇），我会对比它们的主题、方法、结论与空白。
             </p>
             <div className="review-pick">
-              {papers.map((p) => (
-                <label key={p.id} className={`pick${selIds.includes(p.id) ? ' on' : ''}`}>
-                  <input type="checkbox" checked={selIds.includes(p.id)} onChange={() => toggleSel(p.id)} />
+              {readyPapers.map((p) => (
+                <label key={p.id} className={`pick${selIds.includes(p.id) ? ' on' : ''}${p.has_analysis ? '' : ' disabled'}`}
+                  title={p.has_analysis ? undefined : '这篇论文还没有生成导读，无法纳入综述'}>
+                  <input type="checkbox" checked={selIds.includes(p.id)} disabled={!p.has_analysis}
+                    onChange={() => toggleSel(p.id)} />
                   <span className="pt2">{p.title || p.filename}</span>
                   {p.collected ? <span className="badge">已收藏</span> : null}
+                  {!p.has_analysis ? <span className="badge error">未生成导读</span> : null}
                 </label>
               ))}
             </div>
@@ -320,9 +389,9 @@ export default function Home() {
         <div className="modal" onClick={(e) => e.stopPropagation()}>
           <h2>隐私与数据说明</h2>
           <div className="privacy">
-            <p><b>数据存储位置</b>：你的论文原文、生成的导读/术语/卡片/笔记/标亮、阅读计划与文件夹，全部保存在<b>本机</b>（后端 <code>backend/data/</code> 目录下的 SQLite 与 PDF 文件），不会上传到本应用以外的服务器。</p>
+            <p><b>数据存储位置</b>：你的论文原文、生成的导读/术语/卡片/笔记/标亮、阅读计划与文件夹，全部保存在<b>本机</b>（打包版在程序目录的 <code>data/</code>，源码运行在 <code>backend/data/</code>；SQLite + PDF 文件），不会上传到本应用以外的服务器。</p>
             <p><b>模型调用</b>：生成导读、翻译、术语解释、子对话、自测等功能，会把<b>相关论文正文片段与你的提问</b>发送到你配置的模型服务（默认阿里云 DashScope）用于推理。请仅上传你有权处理的论文，并在填写 API Key 前确认服务商的隐私政策。</p>
-            <p><b>API Key</b>：仅保存在本机（<code>backend/.env</code> 或本机数据库），不回显明文、不记录日志、不对外发送（仅用于调用你配置的模型接口）。</p>
+            <p><b>API Key</b>：仅保存在本机数据库（源码运行也可预置在 <code>backend/.env</code>），不回显明文、不记录日志、不对外发送（仅用于调用你配置的模型接口）。</p>
             <p><b>你的权利</b>：可随时在首页逐篇删除论文，或用下方按钮<b>一键清除全部本地数据</b>。</p>
           </div>
           <div className="row">

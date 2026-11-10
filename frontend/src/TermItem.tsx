@@ -24,32 +24,37 @@ export default function TermItem({
   term, zh, top, card, onExpand, onCollapse, onDelete, onTop, onDrop, onJump,
 }: Props) {
   const [confirmDel, setConfirmDel] = useState(false)
-  const drag = useRef<{ startY: number; startTop: number; moved: boolean } | null>(null)
+  const drag = useRef<{ startY: number; startTop: number; currentTop: number; moved: boolean } | null>(null)
   const dragged = useRef(false)
   const expanded = !!card && !card.data.collapsed
   const d = card?.data ?? {}
   const loading = expanded && !!d.pending
   const error = expanded && !!d.error
 
-  const toggle = () => { expanded ? onCollapse() : onExpand() }
+  const toggle = () => {
+    if (expanded) onCollapse()
+    else onExpand()
+  }
 
   const down = (e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest('button')) return
     dragged.current = false
-    drag.current = { startY: e.clientY, startTop: top, moved: false }
+    drag.current = { startY: e.clientY, startTop: top, currentTop: top, moved: false }
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* ignore */ }
   }
   const move = (e: React.PointerEvent) => {
     if (!drag.current) return
     if (Math.abs(e.clientY - drag.current.startY) > 4) { drag.current.moved = true; dragged.current = true }
     if (!drag.current.moved) return
-    onTop(Math.max(0, drag.current.startTop + e.clientY - drag.current.startY))
+    const next = Math.max(0, drag.current.startTop + e.clientY - drag.current.startY)
+    drag.current.currentTop = next
+    onTop(next)
   }
   const up = () => {
     if (!drag.current) return
-    const moved = drag.current.moved
+    const { moved, currentTop } = drag.current
     drag.current = null
-    if (moved) onDrop(top)
+    if (moved) onDrop(currentTop)
   }
   const clickHead = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('button')) return
@@ -94,7 +99,7 @@ export default function TermItem({
         )}
       </div>
       {expanded && <div className="cb">
-        {d.zh && <div className="term-zh">{d.zh}</div>}
+        {typeof d.zh === 'string' && d.zh && <div className="term-zh">{d.zh}</div>}
         {error ? <div className="err">解释生成失败：{d.error}</div>
           : loading ? <div className="loading">正在生成解释…</div>
           : <Markdown className="tr" text={d.expl || ''} />}

@@ -57,6 +57,16 @@ jobs:
         if: runner.os == 'Linux'
         run: python -m pip install patchelf
 
+      - name: Run backend tests
+        shell: bash
+        run: |
+          set -e
+          python tests/test_formula_regions.py
+          python tests/test_page_continuation.py
+          python tests/test_translate_selection.py
+          python tests/test_table_regions.py
+          python tests/test_model_settings.py
+
       - name: Build package
         shell: bash
         run: |
@@ -132,12 +142,17 @@ jobs:
           解压即用，**不需要安装 Python 或 Node**。
 
           ### 本版亮点
-          - 模型设置重构：支持多提供商并存，「翻译」与「其他任务」可分别绑定不同提供商和模型（本地小模型翻译、云端模型做导读）
-          - 内置 200+ 家 OpenAI 兼容服务商目录（models.dev 离线快照），支持一键获取模型列表、搜索 / 全选
-          - 思考强度按模型能力动态显示，调用失败自动降级；本地 Ollama / LM Studio / vLLM 可留空 Key
-          - 新增表格阅读：点击表格查看 / 复制图片 / 「问这张表」；表题进入导读，表内文字不再污染正文摘要
-          - 公式框选继续使用版面模型：直接吸附到整条公式，并自动去掉右侧编号
-          - 修复数据目录搬家后 PDF 打不开的问题
+          - **批量上传**：一次拖入或选择多篇 PDF，后台逐篇解析，某篇失败可单独重试，不影响其余论文
+          - **划词翻译**：拖选正文点「译」，选区旁即时显示译文，自动结合所在段落理解语境
+          - **跨页段落合并**：段落跨页时翻译 / 追问 / 导读不再只拿到半段，页码显示「第 N–M 页」
+          - **表格阅读**：点击表格查看 / 复制图片 /「问这张表」；表题进入导读，表内文字不再污染正文摘要
+          - **多提供商模型设置**：翻译与其他任务可分别绑定不同提供商和模型，内置 200+ 家 OpenAI 兼容服务商目录
+          - **切换论文不再串台**：卡片、标亮、搜索、公式结果按论文隔离，切换后旧请求不会覆盖新论文
+          - **导读更可靠**：部分小节生成失败时保留上次结果，不再用占位内容覆盖已有导读
+          - **文献综述**只允许选择已生成导读的论文，前后端都会给出明确提示
+          - **内存修复**：缩放 / 换文档时正确释放 pdf.js 文档与文字层，长时间阅读不再越用越卡
+          - **本地 API 加固**：只接受本机 Host，并校验 Origin / Sec-Fetch-Site，挡住 DNS rebinding 与跨站写操作
+          - 修复删除 / 复制论文、表格重新识别、术语锚点等若干数据一致性问题
           - 公式识别仍是本地 OCR，模型随包提供，首次识别无需联网下载
 
           ### 下载哪个？

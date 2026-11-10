@@ -15,5 +15,6 @@ function useHash() {
 export default function App() {
   const h = useHash()
   const m = h.match(/^#\/paper\/(\w+)/)
-  return m ? <PaperView id={m[1]} /> : <Home />
+  // key 让切换论文时直接重建工作台，彻底丢掉上一篇的卡片/异步请求状态
+  return m ? <PaperView key={m[1]} id={m[1]} /> : <Home />
 }

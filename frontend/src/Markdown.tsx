@@ -45,9 +45,11 @@ function inline(text: string, mathBlocks: string[] = []): React.ReactNode[] {
  * 用于子对话/术语卡消息与文献综述展示。
  */
 export default function Markdown({ text, className }: { text: string; className?: string }) {
+  // 后端字段偶尔不是字符串（模型返回对象/数组）时也不要把整棵 React 树弄崩
+  const src = typeof text === 'string' ? text : (text == null ? '' : String(text))
   // 多行 $$...$$ / \[...\] 先替换成单行占位符，避免被按行拆开后找不到闭合符。
   const mathBlocks: string[] = []
-  const body = (text || '').replace(/(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\])/g, (m) => {
+  const body = src.replace(/(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\])/g, (m) => {
     mathBlocks.push(m)
     return `\u0001MATH${mathBlocks.length - 1}\u0001`
   })

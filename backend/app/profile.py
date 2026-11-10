@@ -4,9 +4,16 @@
 """
 import json
 
-from . import llm, summarize
+from . import llm
 
 FAMILIARITY = ["新手", "进阶", "熟手"]
+
+
+def _strs(value, limit: int = 8) -> list[str]:
+    """模型偶尔把数组写成字符串：只接受真正的 list，并过滤空项。"""
+    if not isinstance(value, list):
+        return []
+    return [x.strip() for x in value if isinstance(x, str) and x.strip()][:limit]
 
 
 def _abstract(structure: dict) -> str:
@@ -56,6 +63,9 @@ DOMAIN_TERMS = {
 
 def _dict_terms(domain: str) -> list[str] | None:
     """本地领域词典命中则返回术语，否则 None（交给模型生成）。"""
+    domain = (domain or "").strip()
+    if not domain:
+        return None
     for k, v in DOMAIN_TERMS.items():
         if k in domain or domain in k:
             return v
@@ -71,8 +81,7 @@ def _llm_terms(domain: str, title: str, abstract: str) -> list[str]:
 摘要参考：{abstract[:500]}"""
     try:
         data = llm.chat_json(prompt, "你是学术领域术语助手。")
-        terms = [t for t in data.get("terms", []) if isinstance(t, str) and t.strip()]
-        return terms[:8]
+        return _strs(data.get("terms"), 8)
     except Exception:
         return []
 
@@ -88,8 +97,9 @@ def guess_domain(structure: dict) -> dict:
 摘要：{abstract[:800]}"""
     try:
         data = llm.chat_json(prompt, "你是学术领域分类助手，只判断领域。")
-        domain = (data.get("domain") or "").strip() or "未分类"
-        reason = data.get("reason", "")
+        raw_domain = data.get("domain")
+        domain = (raw_domain.strip() if isinstance(raw_domain, str) else "") or "未分类"
+        reason = str(data.get("reason") or "")
     except Exception:
         domain, reason = "未分类", ""
     terms = _dict_terms(domain)
@@ -105,7 +115,7 @@ TERM_DEPTH_BY_FAMILIARITY = {"新手": "terminology_deep", "进阶": "normal", "
 
 
 def _term_depth(familiarity: str) -> str:
-    return TERM_DEPTH_BY_FAMILIARITY.get(familiarity, "normal")
+    return TERM_DEPTH_BY_FAMILIARITY.get(familiarity if isinstance(familiarity, str) else "", "normal")
 
 
 def make_plan(structure: dict, domain: str, familiarity: str, known_terms: list[str]) -> dict:
@@ -122,23 +132,30 @@ def make_plan(structure: dict, domain: str, familiarity: str, known_terms: list[
 
 论文概况：{json.dumps(brief, ensure_ascii=False)[:2500]}"""
     data = llm.chat_json(prompt, "你是论文阅读规划助手，输出可执行的具体建议。")
-    return {
-        "summary": data.get("summary", ""),
-        "focus": [x for x in data.get("focus", []) if isinstance(x, str)][:4],
-        "skip": [x for x in data.get("skip", []) if isinstance(x, str)][:4],
+    emphasis = data.get("abstract_emphasis")
+    plan = {
+        "summary": str(data.get("summary") or ""),
+        "focus": _strs(data.get("focus"), 4),
+        "skip": _strs(data.get("skip"), 4),
         "term_depth": _term_depth(familiarity),
-        "abstract_emphasis": data.get("abstract_emphasis", "方法"),
-        "suggestions": [x for x in data.get("suggestions", []) if isinstance(x, str)][:3],
+        "abstract_emphasis": emphasis if isinstance(emphasis, str) and emphasis else "方法",
+        "suggestions": _strs(data.get("suggestions"), 3),
         "domain": domain, "familiarity": familiarity,
     }
+    if not (plan["summary"] or plan["focus"] or plan["skip"] or plan["suggestions"]):
+        raise RuntimeError("模型没有返回可用的阅读计划")
+    return plan
 
 
 def _profile_lines(domain: str, familiarity: str, history: list[dict],
                    plan: dict | None, scope_label: str = "") -> tuple[str, str, str]:
+    if not isinstance(plan, dict):
+        plan = None
     hist = json.dumps([{"title": h.get("title"), "domain": h.get("domain"),
-                        "asked": h.get("asked", [])[:6]} for h in history][:8], ensure_ascii=False)
-    focus = [x for x in ((plan or {}).get("focus") or []) if isinstance(x, str)]
-    skip = [x for x in ((plan or {}).get("skip") or []) if isinstance(x, str)]
+                        "asked": (h.get("asked") or [])[:6]}
+                       for h in (history or [])][:8], ensure_ascii=False)
+    focus = _strs((plan or {}).get("focus"))
+    skip = _strs((plan or {}).get("skip"))
     plan_line = ""
     if focus:
         plan_line += f"\n读者的阅读计划重点关注：{'；'.join(focus)}。"
@@ -172,7 +189,7 @@ def recommend_queries(structure: dict, domain: str, familiarity: str, known_term
 - 不要推荐阅读历史里已经读过的论文。"""
     data = llm.chat_json(prompt, "你是论文检索规划助手，只输出检索方向，不输出具体论文条目。")
     out = []
-    for q in data.get("queries", []):
+    for q in data.get("queries") or []:
         if not isinstance(q, dict):
             continue
         query = str(q.get("query") or "").strip()
@@ -211,7 +228,9 @@ def recommend_reasons(papers: list[dict], structure: dict, domain: str, familiar
 {chr(10).join(packs)}"""
     data = llm.chat_json(prompt, "你是论文阅读推荐助手，只能基于给定的真实论文信息写理由，严禁编造。")
     by_idx: dict[int, str] = {}
-    for r in data.get("reasons", []):
+    for r in data.get("reasons") or []:
+        if not isinstance(r, dict):
+            continue
         try:
             idx = int(r.get("index"))
         except (TypeError, ValueError):
@@ -227,11 +246,13 @@ def review(papers: list[dict]) -> dict:
     packs = []
     interests = []
     for p in papers:
-        a = p.get("analysis") or {}
-        els = {e.get("kind"): e.get("text") for e in a.get("elements", [])}
+        a = p.get("analysis") if isinstance(p.get("analysis"), dict) else {}
+        raw_els = a.get("elements")
+        els = {e.get("kind"): e.get("text") for e in (raw_els if isinstance(raw_els, list) else [])
+               if isinstance(e, dict) and e.get("kind")}
         line = f"### {p.get('title', '')}（领域：{p.get('domain', '')}）\n"
         line += "\n".join(f"- {k}：{v}" for k, v in els.items())
-        focus = [x for x in (p.get("focus") or []) if isinstance(x, str)]
+        focus = _strs(p.get("focus"))
         if focus:
             line += "\n- 读者在本篇的重点关注：" + "；".join(focus)
             interests += focus
@@ -245,5 +266,6 @@ def review(papers: list[dict]) -> dict:
 输出 JSON：{"review": "Markdown 格式的综述正文（用二级/三级标题与列表）"}
 """ + interest_line + "\n" + "\n\n".join(packs)
     data = llm.chat_json(prompt, "你是文献综述助手，基于给定材料，不要编造未提供的细节。", fallback_key="review")
-    return {"review": data.get("review") or data.get("result", ""),
+    review = data.get("review") or data.get("result") or ""
+    return {"review": review if isinstance(review, str) else json.dumps(review, ensure_ascii=False),
             "count": len(papers)}

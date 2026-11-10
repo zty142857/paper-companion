@@ -6,7 +6,8 @@
 
 仍然需要这里的三件事：
 
-1. 过滤首页作者/单位区误检——PyMuPDF 会把作者块标成 table；
+1. 过滤首页作者/单位区、ARTICLE INFO / ABSTRACT 栏误检——PyMuPDF 会把
+   这类版面元素标成 table；
 2. 把旋转表、字体乱码表降级为图片（394f p4 / p7）；
 3. 用解析后的 blocks 配对表题，并给落在表框里的段落打 ``table_id``。
 
@@ -17,12 +18,15 @@ import re
 
 import pymupdf
 
-TABLES_VERSION = 2
+TABLES_VERSION = 3
 
 CAPTION_RE = re.compile(r"^\s*(?:(?:table|tab\.)\s*[IVXLC\d]+|表\s*\d+)", re.I)
 AFFIL_RE = re.compile(
     r"\b(university|institute|college|school|department|faculty|laborator(?:y|ies)"
     r"|academy|e-?mail|univ\.)\b|@", re.I)
+# 首页 ARTICLE INFO / ABSTRACT 小标题；PDF 里常被拆成 ``A R T I C L E I N F O``
+FRONT_MATTER_RE = re.compile(r"ARTICLEINFO|ABSTRACT")
+_SENTENCE_RE = re.compile(r"[.!?。！？]")
 
 # 表格框内出现这些字符说明字体映射坏了（394f p7 的 Symbol 字体）
 _BAD_CHARS = ("\ufffd",)
@@ -139,6 +143,53 @@ def _is_author_block(rows, box, page_no: int, page_h: float) -> bool:
     return bool(AFFIL_RE.search(rows_text(rows)))
 
 
+def _squash(text: str) -> str:
+    """去掉所有空白并转大写：``A B S T R A C T`` → ``ABSTRACT``。"""
+    return re.sub(r"\s+", "", text or "").upper()
+
+
+def _column_lens(rows: list[list[str]]) -> list[int]:
+    """每列最长单元格的字符数；行不齐时按已有单元格算。"""
+    ncol = max((len(r) for r in rows), default=0)
+    return [max((len(r[c]) for r in rows if c < len(r)), default=0) for c in range(ncol)]
+
+
+def _is_front_matter(rows, box, page_no: int, page_h: float,
+                     has_caption: bool = False) -> bool:
+    """首页上半部被当成表的 ARTICLE INFO / ABSTRACT 栏，判掉。
+
+    判据（须同时满足，宁可漏判也不误杀真表）：
+
+    1. 第 1 页、表框顶边在页面上半部（<45% 页高），且没有表题——有表题就
+       基本是真表，直接放过；
+    2. 2~4 列；
+    3. 主判据：框内前两行出现 ``ARTICLE INFO`` / ``ABSTRACT`` 小标题（PDF 里
+       字母间常被空格拆开，先归一化再匹配），且框内至少有 120 字符的
+       正文式单元格——目录式栏目的另一侧总是成段 prose；
+    4. 兜底：两列、其中一列有 ≥200 字符且带 2 个以上句末标点的 prose，
+       另一列最长单元格 ≤80 字符（短标签/关键词）。真表的两列通常一侧是
+       数值或短语，不会整段成句，所以阈值取保守值。
+    """
+    if page_no != 1 or not page_h or has_caption:
+        return False
+    if box[1] > page_h * 0.45:
+        return False
+    lens = _column_lens(rows)
+    if not 2 <= len(lens) <= 4:
+        return False
+    prose = max(lens, default=0)
+    if prose < 120:
+        return False
+    head = _squash(" ".join(" ".join(r) for r in rows[:2]))
+    if FRONT_MATTER_RE.search(head):
+        return True
+    if len(lens) != 2 or prose < 200 or min(lens) > 80:
+        return False
+    idx = lens.index(prose)
+    body = " ".join(_cell_text(r[idx]) for r in rows if idx < len(r))
+    return len(_SENTENCE_RE.findall(body)) >= 2 and "," in body
+
+
 def _caption_candidate(box, block, used: set[str]) -> tuple[int, float] | None:
     """返回 (优先级, 间距)：0=上方 1=下方 2=左侧 3=右侧。"""
     if block.get("id") in used:
@@ -234,18 +285,28 @@ def _dedupe(tables: list[dict]) -> list[dict]:
 
 
 def detect_table_pages(doc) -> list[int]:
-    """版面模型标了 table 的页（0-based）。老论文懒补时先筛页，避免 to_json 全篇。"""
-    out = []
+    """版面模型标了 table 的页（0-based）。老论文懒补时先筛页，避免 to_json 全篇。
+
+    如果所有有文字的页都跑不动版面模型，抛出异常而不是返回空列表：调用方据此
+    保留旧表格数据，避免把「模型不可用」误当成「这篇没有表」并永久清空。
+    """
+    out, scanned, failed = [], 0, 0
     for page in doc:
         try:
             if not page.get_text("text").strip():
                 continue
+        except Exception:
+            continue
+        scanned += 1
+        try:
             page.get_layout()
             info = page.layout_information or []
             if any(str(e[4]) == "table" for e in info):
                 out.append(page.number)
         except Exception:
-            continue
+            failed += 1
+    if scanned and failed == scanned:
+        raise RuntimeError("版面模型不可用，无法识别表格")
     return out
 
 
@@ -303,10 +364,12 @@ def extract_tables(doc, blocks: list[dict], pages: list[int] | None = None) -> l
                     float(box.get("x1") or 0), float(box.get("y1") or 0))
             if _is_author_block(rows, bbox, page_no, page_h):
                 continue
-            in_spans = _inside_spans(bbox, spans)
-            quality, reason = _quality(rows, in_spans, page_h)
             caption, cid = caption_for(bbox, by_page.get(page_no) or [], used_captions,
                                        line_cache.get(page_no) or [])
+            if _is_front_matter(rows, bbox, page_no, page_h, bool(caption)):
+                continue
+            in_spans = _inside_spans(bbox, spans)
+            quality, reason = _quality(rows, in_spans, page_h)
             if cid:
                 used_captions.add(cid)
             tables.append({
@@ -357,7 +420,11 @@ def ensure_tables(structure: dict, pdf_path: str) -> list[dict]:
     doc = pymupdf.open(pdf_path)
     try:
         blocks = structure.get("blocks") or []
+        old_tables = structure.get("tables") or []
         tables = extract_tables(doc, blocks)
+        if not tables and old_tables:
+            # 空结果更可能是版面模型这次没跑成功；宁可保留旧表，也不要清空已有数据
+            tables = old_tables
         tag_table_blocks(blocks, tables)
     finally:
         doc.close()

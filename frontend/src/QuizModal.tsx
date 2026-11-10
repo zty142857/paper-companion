@@ -14,9 +14,9 @@ export default function QuizModal({ pid, onJump, onClose }: {
   const [making, setMaking] = useState(false)
   const [err, setErr] = useState('')
   const answersRef = useRef<string[]>([])
-  answersRef.current = answers
   const gradedRef = useRef(false)
-  gradedRef.current = !!grade
+  useEffect(() => { answersRef.current = answers }, [answers])
+  useEffect(() => { gradedRef.current = !!grade }, [grade])
 
   // 打开时先恢复上次那套题（含作答与判分结果），没有才出题
   const gen = useCallback(() => {
@@ -71,12 +71,12 @@ export default function QuizModal({ pid, onJump, onClose }: {
             return (
               <div key={i} className={`q${r ? (r.correct ? ' right' : ' wrong') : ''}`}>
                 <div className="qt">
-                  {i + 1}. {q.q}
+                  {i + 1}. {String(q.q ?? '')}
                   {r && <span className={`mark ${r.correct ? 'ok' : 'no'}`}>{r.correct ? '✓ 正确' : '✗ 错误'}</span>}
                 </div>
                 {q.type === 'choice' ? (
                   <div className="opts">
-                    {q.options?.map((o) => (
+                    {(Array.isArray(q.options) ? q.options : []).map((o) => (
                       <label key={o} className={`opt${answers[i] === o ? ' on' : ''}${grade && o === q.answer ? ' ans' : ''}`}>
                         <input type="radio" name={`q${i}`} disabled={!!grade}
                           checked={answers[i] === o} onChange={() => set(i, o)} />
@@ -89,11 +89,11 @@ export default function QuizModal({ pid, onJump, onClose }: {
                     value={answers[i]} onChange={(e) => set(i, e.target.value)} />
                 )}
                 {r && <div className="qfb">
-                  {q.type === 'choice' && !r.correct && <div>正确答案：{q.answer}</div>}
-                  {r.feedback && <div>{r.feedback}{r.hit ? `（要点 ${r.hit}）` : ''}</div>}
-                  {q.explain && <div className="qexp">{q.explain}</div>}
-                  {q.reference && <div className="qexp">参考：{q.reference}</div>}
-                  {!!q.pages?.length && <div className="src">
+                  {q.type === 'choice' && !r.correct && <div>正确答案：{String(q.answer ?? '')}</div>}
+                  {r.feedback && <div>{String(r.feedback)}{r.hit ? `（要点 ${String(r.hit)}）` : ''}</div>}
+                  {q.explain && <div className="qexp">{String(q.explain)}</div>}
+                  {q.reference && <div className="qexp">参考：{String(q.reference)}</div>}
+                  {Array.isArray(q.pages) && q.pages.length > 0 && <div className="src">
                     {q.pages.map((p) => <button key={p} onClick={() => onJump(p)}>📄 回原文第{p}页</button>)}
                   </div>}
                 </div>}

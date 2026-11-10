@@ -26,15 +26,24 @@ export default function ProfileModal({ pid, onDone, onClose }: {
     }).catch((e) => setErr(String(e?.message || e)))
   }, [pid])
 
-  const terms = data?.guess.terms ?? []
+  // 同领域旧档案里已勾选的术语也要显示出来，否则用户没法取消勾选
+  const terms = Array.from(new Set([
+    ...(data?.guess.terms ?? []),
+    ...(data?.prior?.known_terms ?? []),
+  ]))
   const reuse = !!data?.prior
   const toggle = (t: string) =>
     setKnown((k) => k.includes(t) ? k.filter((x) => x !== t) : [...k, t])
 
   const submit = async (useHistory: boolean) => {
     setBusy(true); setErr('')
+    const prior = data?.prior
+    // 「沿用上次摸底」= 原样复用同领域档案，不把本次表单里的临时修改带进去
+    const body = useHistory && prior
+      ? { domain: prior.domain, familiarity: prior.familiarity, known_terms: prior.known_terms, reuse: true }
+      : { domain, familiarity: level, known_terms: known, reuse: false }
     try {
-      await api.survey(pid, { domain, familiarity: level, known_terms: known, reuse: useHistory && reuse })
+      await api.survey(pid, body)
       onDone()
     } catch (e: any) { setErr(String(e?.message || e)); setBusy(false) }
   }

@@ -23,39 +23,46 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
   const [busy, setBusy] = useState(false)
   const [confirmDel, setConfirmDel] = useState(false)
   const [noteText, setNoteText] = useState<string>(card.data?.text ?? '')
-  const drag = useRef<{ startY: number; startTop: number; moved: boolean } | null>(null)
+  const drag = useRef<{ startY: number; startTop: number; currentTop: number; moved: boolean } | null>(null)
   const dragged = useRef(false)
   const d = card.data
   useEffect(() => { setNoteText(d.text ?? '') }, [card.id, d.text])
   const isGlobalChat = card.type === 'chat' && !!d.global
   const isTableChat = card.type === 'chat' && !!d.table_id
-  const title = card.type === 'translation' ? (d.pending ? '译文 · 翻译中…' : d.error ? '译文 · 失败' : `译文 · 第${d.page ?? '?'}页`)
+  const isSelTrans = card.type === 'translation' && !!d.selection
+  const title = card.type === 'translation'
+    ? (d.pending ? '译文 · 翻译中…' : d.error ? '译文 · 失败'
+      : `${isSelTrans ? '划词译文' : '译文'} · 第${d.page ?? '?'}页`)
     : card.type === 'term' ? `术语 · ${d.term}` : card.type === 'note' ? '笔记'
       : isTableChat ? `表格 · ${String(d.table_caption || d.table_id).slice(0, 36)}`
         : isGlobalChat ? '子对话 · 🌐全文' : '子对话'
   // 收起时也显示一段预览，避免用户以为卡片是空的
-  const preview = card.type === 'translation'
+  const rawPreview = card.type === 'translation'
     ? (d.error ? `翻译失败：${d.error}` : d.pending ? '翻译中…' : (d.translation || d.orig || ''))
     : card.type === 'note' ? (d.text || '点开写笔记…')
     : ((d.messages ?? []).slice(-1)[0]?.content || '点开输入你的问题')
+  const preview = typeof rawPreview === 'string' ? rawPreview : String(rawPreview ?? '')
 
   const down = (e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest('button')) return
     dragged.current = false
-    drag.current = { startY: e.clientY, startTop: top, moved: false }
+    drag.current = { startY: e.clientY, startTop: top, currentTop: top, moved: false }
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* ignore */ }
   }
   const move = (e: React.PointerEvent) => {
     if (!drag.current) return
     if (Math.abs(e.clientY - drag.current.startY) > 4) { drag.current.moved = true; dragged.current = true }
     if (!drag.current.moved) return
-    onTop(Math.max(0, drag.current.startTop + e.clientY - drag.current.startY))
+    // 用 ref 记录当前位置：pointerup 与最后一次 pointermove 同帧时，props.top 还是旧值
+    const next = Math.max(0, drag.current.startTop + e.clientY - drag.current.startY)
+    drag.current.currentTop = next
+    onTop(next)
   }
   const up = () => {
     if (!drag.current) return
-    const moved = drag.current.moved
+    const { moved, currentTop } = drag.current
     drag.current = null
-    if (moved) onDrop(top)
+    if (moved) onDrop(currentTop)
   }
   const clickHead = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('button')) return
@@ -113,7 +120,7 @@ export default function CardItem({ card, top, active, onActivate, onTop, onDrop,
         </>}
         {(card.type === 'chat' || card.type === 'term') && <>
           {card.type === 'term' && <>
-            {card.data.zh && <div className="term-zh">{d.zh}</div>}
+            {typeof d.zh === 'string' && d.zh && <div className="term-zh">{d.zh}</div>}
             {d.error ? <div className="err">解释生成失败：{d.error}</div>
               : d.pending ? <div className="loading">正在生成解释…</div>
               : <Markdown className="tr" text={d.expl} />}

@@ -54,11 +54,44 @@ def test_normalize_rows_merges_empty_key_continuation():
 
 
 def test_author_block_filter():
-    rows = [["Zheshuai Yang", "School of Mechanical Engineering"],
-            ["author@example.edu", "Xi'an Jiaotong University"]]
+    rows = [["A. Author", "School of Mechanical Engineering"],
+            ["author@example.edu", "Example University"]]
     assert tr._is_author_block(rows, (54, 145, 543, 260), 1, 842)
     # 真表：第 1 页下方、带数值，不应被过滤
     assert not tr._is_author_block([["Cable 1", "0.0099"]], (54, 500, 543, 600), 1, 842)
+
+
+def test_front_matter_abstract_filter():
+    # Elsevier 首页 ARTICLE INFO / ABSTRACT 栏：标题被空格拆开，右侧整段摘要
+    prose = ("Media multitasking refers to simultaneous engagement in two activities, "
+             "or the act of switching between multiple activities. " * 3)
+    rows = [["A R T I C L E I N F O", "A B S T R A C T"],
+            ["Keywords: Media multitasking", prose]]
+    box = (37.6, 263.9, 557.7, 441.3)
+    assert tr._is_front_matter(rows, box, 1, 842)
+    # 有表题的真表不误杀
+    assert not tr._is_front_matter(rows, box, 1, 842, has_caption=True)
+    # 第 2 页同类栏目不按首页前置内容处理
+    assert not tr._is_front_matter(rows, box, 2, 842)
+    # 首页下方带数值的真表不误杀
+    assert not tr._is_front_matter([["Cable 1", "0.0099"], ["Cable 2", "0.0128"]],
+                                   (54, 500, 543, 600), 1, 842)
+
+
+def test_front_matter_fallback_short_label_and_prose():
+    # 没有 ABSTRACT 标题时的兜底：两列、一侧短标签、一侧长句 prose
+    prose = ("This study examined how social media notifications affect reading, "
+             "and whether summarization helps. " * 3)
+    rows = [["Keywords:", "Multiple document literacy"], ["", prose]]
+    assert tr._is_front_matter(rows, (54, 200, 543, 400), 1, 842)
+    # 反例：两列表整段都是短语/数值，不能按 prose 处理
+    assert not tr._is_front_matter([["Variable", "M (SD)"],
+                                    ["Working memory", "20.14 (8.14)"],
+                                    ["Prior knowledge", "14.53 (2.05)"]],
+                                   (54, 200, 543, 400), 1, 842)
+    # 反例：两列都成段（正文/参考文献栏），不套用兜底
+    assert not tr._is_front_matter([[prose, prose + " " + prose]],
+                                   (54, 200, 543, 400), 1, 842)
 
 
 def test_caption_for_above_and_rotated():

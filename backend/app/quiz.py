@@ -16,8 +16,10 @@ def make_quiz(structure: dict, analysis: dict | None, familiarity: str | None = 
     digest, _ = summarize.build_digest(structure)
     elems = ""
     if analysis:
-        elems = "\n".join(f"- {e['kind']}：{e['text']}" for e in analysis.get("elements", []))
-    tone = _QUIZ_TONE.get(familiarity, "") if familiarity else ""   # 无画像→不加难度提示
+        elems = "\n".join(f"- {e['kind']}：{e['text']}"
+                          for e in (analysis.get("elements") or [])
+                          if isinstance(e, dict) and e.get("kind"))
+    tone = _QUIZ_TONE.get(familiarity, "") if isinstance(familiarity, str) else ""
     prompt = f"""基于下面的论文导读与原文，出 3 道检验「是否读懂全篇」的自测题。要求：
 - 2 道单选题（4 个选项，考查核心结论/方法/创新点），1 道简答题（考查对方法的理解，给出 2-4 个评分要点）。
 - 每题给出该题内容对应的原文页码（pages）与块ID（refs），便于答错后跳回原文。
@@ -36,12 +38,28 @@ def make_quiz(structure: dict, analysis: dict | None, familiarity: str | None = 
 {digest}"""
     data = llm.chat_json(prompt, "你是学术自测出题助手，题目须严格基于原文。")
     valid = {b["id"] for b in structure["blocks"]}
+    raw = data.get("questions")
     qs = []
-    for q in data.get("questions", [])[:3]:
-        if q.get("type") not in ("choice", "short"):
+    for q in (raw if isinstance(raw, list) else [])[:3]:
+        if not isinstance(q, dict) or q.get("type") not in ("choice", "short"):
             continue
-        q["refs"] = [r for r in q.get("refs", []) if r in valid]
-        q["pages"] = q.get("pages", [])[:4]
+        q = dict(q)
+        q["q"] = str(q.get("q") or "")
+        q["refs"] = [r for r in (q.get("refs") or []) if isinstance(r, str) and r in valid]
+        q["pages"] = [p for p in (q.get("pages") or []) if isinstance(p, int)][:4]
+        if q["type"] == "choice":
+            options = [str(x) for x in (q.get("options") or [])
+                       if x is not None and str(x).strip()]
+            if len(options) < 2:
+                continue
+            q["options"] = options
+            q["answer"] = str(q.get("answer") or "").strip()
+            if q["answer"] not in options:
+                continue      # 答案不在选项里的选择题无法判分，直接丢弃
+        else:
+            q["keypoints"] = [str(x) for x in (q.get("keypoints") or [])
+                              if x is not None and str(x).strip()]
+            q["reference"] = str(q.get("reference") or "")
         qs.append(q)
     # 保证有 choice/short 结构
     if not any(q["type"] == "choice" for q in qs):
@@ -66,17 +84,29 @@ def grade_quiz(structure: dict, questions: list[dict], answers: list) -> dict:
     if shorts:
         packs = []
         for idx, q in shorts:
-            packs.append(f"### 题{idx}\n题干：{q['q']}\n评分要点：{json.dumps(q.get('keypoints', []), ensure_ascii=False)}\n"
+            packs.append(f"### 题{idx}\n题干：{q.get('q', '')}\n"
+                         f"评分要点：{json.dumps(q.get('keypoints') or [], ensure_ascii=False)}\n"
                          f"参考答案：{q.get('reference', '')}\n学生作答：{answers[idx] or '（未作答）'}")
         prompt = ("逐题批改简答题：对照评分要点，判断学生作答命中了哪些要点、是否理解正确。"
                   "输出 JSON：{\"grades\":[{\"idx\":题号,\"hit\":\"命中的要点数/总要点数\",\"correct\":true/false,\"feedback\":\"简短中文点评\"}]}\n\n"
                   + "\n\n".join(packs))
-        data = llm.chat_json(prompt, "你是严格但鼓励性的阅卷助手。")
-        grades = {g.get("idx"): g for g in data.get("grades", [])}
+        grade_error = ""
+        try:
+            data = llm.chat_json(prompt, "你是严格但鼓励性的阅卷助手。")
+        except Exception as e:      # 判分失败不要把人已作答的整套题弄丢
+            data, grade_error = {}, f"简答未能自动判分（{llm.brief_error(e)}），请对照参考答案自评。"
+        grades: dict[int, dict] = {}
+        for g in data.get("grades") or []:
+            if not isinstance(g, dict):
+                continue
+            try:
+                grades[int(g.get("idx"))] = g
+            except (TypeError, ValueError):
+                continue
         for idx, q in shorts:
             g = grades.get(idx, {})
             results[idx].update({"correct": bool(g.get("correct")), "hit": g.get("hit", ""),
-                                 "feedback": g.get("feedback", ""),
+                                 "feedback": g.get("feedback") or grade_error,
                                  "reference": q.get("reference", ""), "_pending": False})
     return {"results": results,
             "score": sum(1 for r in results if r.get("correct")),

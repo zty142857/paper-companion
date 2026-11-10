@@ -4,6 +4,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 from . import llm
+from .textblocks import logical_blocks, page_label
 
 ELEMENT_KINDS = ["一句话总览", "研究问题", "方法", "创新点", "实验与结果", "局限与未来工作"]
 DIGEST_CHAR_BUDGET = 48000
@@ -17,7 +18,8 @@ def build_digest(structure: dict) -> tuple[str, dict]:
     blocks = {b["id"]: b for b in structure["blocks"]}
     sec_title = {s["id"]: s["title"] for s in structure["sections"]}
     ref_sec = {s["id"] for s in structure["sections"] if s["is_references"]}
-    cand = [b for b in structure["blocks"]
+    # 跨页段落只输出一次：逻辑段落已把后半块拼回第一块，避免导读里同一段出现两遍
+    cand = [b for b in logical_blocks(structure)
             if b["type"] not in ("figure", "formula")
             and not b.get("table_id")
             and b["section_id"] not in ref_sec]
@@ -27,7 +29,7 @@ def build_digest(structure: dict) -> tuple[str, dict]:
         groups.setdefault(b["section_id"], []).append(b)   # dict 保序：按文档顺序
 
     def prefix(b) -> str:
-        return f"[{b['id']}|第{b['page']}页|{sec_title.get(b['section_id'], '')}] "
+        return f"[{b['id']}|{page_label(b)}|{sec_title.get(b['section_id'], '')}] "
 
     def line(b, cap: int) -> str:
         t = b["text"]
@@ -87,7 +89,11 @@ def analyze(structure: dict, known_terms: list[str] | None = None, plan: dict | 
     valid = {b["id"] for b in structure["blocks"]}
 
     def elements_task() -> list[dict]:
-        els = _selfcheck(_gen_elements(digest, plan, familiarity), structure)
+        els = _gen_elements(digest, plan, familiarity)
+        try:
+            els = _selfcheck(els, structure)   # 自查失败不算导读失败：保留未自查版本
+        except Exception:
+            pass
         for e in els:
             e["refs"] = [r for r in e["refs"] if r in valid]
             pages = sorted({b["page"] for b in structure["blocks"] if b["id"] in e["refs"]})
@@ -95,7 +101,9 @@ def analyze(structure: dict, known_terms: list[str] | None = None, plan: dict | 
         return els
 
     # 三个生成步骤互不依赖，并行执行（LLM 调用为 IO 阻塞，线程池有效）
-    # 单个子任务失败只降级该部分，不让整份导读报废
+    # 单个子任务失败只降级该部分，不让整份导读报废；失败项记下来，
+    # 调用方可以保留旧的对应部分而不是用空/占位内容覆盖。
+    failed: list[str] = []
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_el = ex.submit(elements_task)
         f_out = ex.submit(_gen_outlines, digest, structure, familiarity)
@@ -103,15 +111,18 @@ def analyze(structure: dict, known_terms: list[str] | None = None, plan: dict | 
         try:
             elements = f_el.result()
         except Exception:
+            failed.append("elements")
             elements = [{"kind": k, "text": "（生成失败，可点顶部「重新生成导读」重试）",
                          "refs": [], "pages": []} for k in ELEMENT_KINDS]
         try:
             outlines = f_out.result()
         except Exception:
+            failed.append("outlines")
             outlines = []
         try:
             terms = f_term.result()
         except Exception:
+            failed.append("terms")
             terms = []
 
     for t in terms:
@@ -119,7 +130,7 @@ def analyze(structure: dict, known_terms: list[str] | None = None, plan: dict | 
     locate_term_refs(terms, structure)
     for t in terms:
         t["pages"] = sorted({b["page"] for b in structure["blocks"] if b["id"] in t["refs"]})[:3]
-    return {"elements": elements, "outlines": outlines, "terms": terms}
+    return {"elements": elements, "outlines": outlines, "terms": terms, "_failed": failed}
 
 
 _ABBR_RE = re.compile(r"\(([^()]{1,10})\)")
@@ -130,18 +141,23 @@ def _norm_term(s: str) -> str:
     return re.sub(r"[\s\xa0]+", " ", s.replace("’", "'").replace("‘", "'")).lower().strip()
 
 
-def locate_term_refs(terms: list[dict], structure: dict) -> None:
+def locate_term_refs(terms: list[dict], structure: dict) -> bool:
     """就地给 refs 为空的术语补一个「该词在原文里首次出现的块」。
 
     LLM 经常给不出 refs（术语所在块被 digest 截断时尤其如此），而 refs 空会导致
     右轨小卡没有锚点（全挤在顶部互相重叠）、点开解释时也没有语境（退化成通用解释）。
-    纯文本匹配，幂等，可在读取旧数据时重复调用。
+    纯文本匹配，幂等；返回是否有改动，调用方可据此把补齐结果写回旧数据。
     """
-    if not terms or all(t.get("refs") for t in terms):
-        return                      # 常见情况：refs 齐全 → 不必扫全文（本函数在每次读论文时都会被调）
+    if not isinstance(terms, list) or not terms:
+        return False
+    if all(isinstance(t, dict) and t.get("refs") for t in terms):
+        return False                # 常见情况：refs 齐全 → 不必扫全文（本函数在每次读论文时都会被调）
     texts = [(b["id"], _norm_term(b.get("text") or "")) for b in structure.get("blocks") or []
              if b.get("text")]
+    changed = False
     for t in terms:
+        if not isinstance(t, dict):
+            continue
         if t.get("refs"):
             continue
         term = (t.get("term") or "").strip()
@@ -154,16 +170,19 @@ def locate_term_refs(terms: list[dict], structure: dict) -> None:
         for bid, txt in texts:
             if any(k in txt for k in keys if k):
                 t["refs"] = [bid]
+                changed = True
                 break
+    return changed
 
 
 def _plan_directive(plan: dict | None) -> str:
     """把阅读计划转为对导读要素的侧重指令（focus/skip/abstract_emphasis）。"""
-    if not plan:
+    if not isinstance(plan, dict) or not plan:
         return ""
     focus = [x for x in (plan.get("focus") or []) if isinstance(x, str)]
     skip = [x for x in (plan.get("skip") or []) if isinstance(x, str)]
-    emph = plan.get("abstract_emphasis") or ""
+    emph = plan.get("abstract_emphasis")
+    emph = emph if isinstance(emph, str) else ""
     # 侧重项映射到对应要素 kind
     emph_kind = {"方法": "方法", "实验": "实验与结果", "创新": "创新点", "应用": "创新点"}.get(emph, "")
     parts = []
@@ -201,12 +220,16 @@ elements 必须按顺序包含这些 kind：{json.dumps(ELEMENT_KINDS, ensure_as
     sys = "你是学术论文导读助手，帮助研究生高效读论文。"
     data = llm.chat_json(prompt, sys)
     out, seen = [], set()
-    for e in data.get("elements", []):
+    for e in data.get("elements") or []:
+        if not isinstance(e, dict):
+            continue
         kind = e.get("kind", "")
         if kind in ELEMENT_KINDS and kind not in seen:
             seen.add(kind)
-            out.append({"kind": kind, "text": e.get("text", ""),
-                        "refs": list(e.get("refs", []))})
+            out.append({"kind": kind, "text": str(e.get("text") or ""),
+                        "refs": [r for r in (e.get("refs") or []) if isinstance(r, str)]})
+    if not seen:
+        raise RuntimeError("模型没有返回可用的导读要素")
     missing = [k for k in ELEMENT_KINDS if k not in seen]
     for k in missing:
         out.append({"kind": k, "text": "（原文中未明确提及）", "refs": []})
@@ -264,7 +287,9 @@ def _gen_outlines(digest: str, structure: dict, familiarity: str | None = None) 
     max_tokens = min(16000, 2048 + len(secs) * 400)
     data = llm.chat_json(prompt, "你是学术论文目录概要助手，逐级概括且每级只写一句话。", max_tokens=max_tokens)
     valid = {s["id"] for s in secs}
-    got = [o for o in data.get("outlines", []) if o.get("section_id") in valid]
+    got = [{"section_id": o["section_id"], "outline": str(o.get("outline") or "")}
+           for o in (data.get("outlines") or [])
+           if isinstance(o, dict) and o.get("section_id") in valid]
     # 兜底：模型偶尔漏掉部分标题 → 单独补生成缺失的
     missing = [s for s in secs if s["id"] not in {o["section_id"] for o in got}]
     if missing:
@@ -276,8 +301,17 @@ def _gen_outlines(digest: str, structure: dict, familiarity: str | None = None) 
 
 论文文本块：
 {digest}"""
-        d2 = llm.chat_json(p2, "你是学术论文目录概要助手。", max_tokens=min(8000, 1024 + len(missing) * 400))
-        got += [o for o in d2.get("outlines", []) if o.get("section_id") in {s["id"] for s in missing}]
+        try:
+            d2 = llm.chat_json(p2, "你是学术论文目录概要助手。",
+                               max_tokens=min(8000, 1024 + len(missing) * 400))
+            missing_ids = {s["id"] for s in missing}
+            got += [{"section_id": o["section_id"], "outline": str(o.get("outline") or "")}
+                    for o in (d2.get("outlines") or [])
+                    if isinstance(o, dict) and o.get("section_id") in missing_ids]
+        except Exception:
+            pass      # 补生成失败就保留第一轮已有概要，不要让整份 outlines 报废
+    if not got:
+        raise RuntimeError("模型没有返回章节概要")
     return got
 
 
@@ -294,7 +328,7 @@ def _gen_terms(digest: str, known_terms: list[str] | None = None, term_depth: st
     if known_terms:
         skip = ("\n读者已声明掌握以下术语，**不要**把它们列入结果（包括其英文、中文或同义写法）："
                 + json.dumps(known_terms, ensure_ascii=False) + "\n")
-    spec = _TERM_DEPTH_SPEC.get(term_depth) if term_depth else None
+    spec = _TERM_DEPTH_SPEC.get(term_depth) if isinstance(term_depth, str) and term_depth else None
     lo_hi, scope = spec if spec else ("8-15", "常规筛选，只列较难的专业术语")
     prompt = f"""从下面的论文文本块中挑出 {lo_hi} 个「跨领域读者或低年级研究生可能不懂」的专业术语/概念。
 不要挑通用词（如 algorithm、model），优先挑：领域特有名词、缩写、方法名、有特定含义的普通词。
@@ -304,12 +338,26 @@ def _gen_terms(digest: str, known_terms: list[str] | None = None, term_depth: st
 论文文本块：
 {digest}"""
     limit = 8 if term_depth == "light" else 15
-    for _ in range(2):  # 并发下偶发空结果，重试一次
-        data = llm.chat_json(prompt, "你是论文术语助手。")
-        terms = data.get("terms", [])
+    last_error = None
+    for _ in range(2):  # 并发下偶发空结果/瞬时失败，重试一次
+        try:
+            data = llm.chat_json(prompt, "你是论文术语助手。")
+        except Exception as e:
+            last_error = e
+            continue
+        last_error = None
+        terms = [{
+            "term": str(t.get("term")).strip(),
+            "zh": str(t.get("zh") or ""),
+            "expl": str(t.get("expl") or ""),
+            "refs": [r for r in (t.get("refs") or []) if isinstance(r, str)],
+        } for t in (data.get("terms") or [])
+            if isinstance(t, dict) and t.get("term")]
         if terms:
             return terms[:limit]
-    return []
+    if last_error:
+        raise last_error
+    raise RuntimeError("术语提取结果为空")
 
 
 def _selfcheck(elements: list[dict], structure: dict) -> list[dict]:
@@ -326,7 +374,7 @@ def _selfcheck(elements: list[dict], structure: dict) -> list[dict]:
 
 """ + "\n\n".join(packs)
     data = llm.chat_json(prompt, "你是事实一致性核查员，宁可保守：无依据就删。")
-    by_kind = {c.get("kind"): c for c in data.get("checks", [])}
+    by_kind = {c.get("kind"): c for c in (data.get("checks") or []) if isinstance(c, dict)}
     for e in elements:
         c = by_kind.get(e["kind"])
         if c and c.get("verdict") == "fix" and c.get("fixed_text"):

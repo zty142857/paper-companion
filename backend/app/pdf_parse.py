@@ -48,6 +48,10 @@ REF_HEADING_RE = re.compile(r"^(references|bibliography|参考文献|references?
 UPPER_HEAD_RE = re.compile(r"[A-Z][A-Z\s,.&\-()]{3,}")
 # 图/表/公式题注虽然也短，但不是章节标题
 CAPTION_RE = re.compile(r"^(figure|fig\.?|table|tab\.?|eq\.?|equation|scheme|algorithm|listing)\b", re.I)
+# 带编号的图/表题前缀："Table 1"/"Fig. 2."/"表 1"；用于区分正文里的 "Table 1 includes…"
+CAPTION_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:figure|fig\.?|table|tab\.?|equation|eq\.?|scheme|algorithm|listing)"
+    r"\s*[IVXLC\d]+[.:]?|表\s*\d+[.:]?)\s*", re.I)
 # 期刊栏目横幅（RESEARCH ARTICLE / OPEN ACCESS…），不是章节
 BANNER_RE = re.compile(
     r"^(research|review|original|short|case|position|technical|editorial|commentary|"
@@ -83,6 +87,19 @@ JUNK_META_RE = re.compile(
     r"^(untitled|no title|microsoft|openoffice|libreoffice|word|papers\b|abstract\b"
     r"|published as\b|accepted\b|submitted\b|preprint\b|working draft\b|journal\b"
     r"|conference\b|\d{4}\b)", re.I)
+
+# 跨页段落链接：后一页的正文块若明显是上一页段落的续写，就在它上面记 cont_of。
+# 只认"上一页段末还没说完 + 下一页以小写/数字继续"或上一行以断词连字符、
+# 逗号、悬空功能词收尾的情况，避免把正常的新段落硬拼在一起。
+BLOCKS_VERSION = 1
+_PAGE_NOTE_RE = re.compile(
+    r"(https?://|www\.|doi\.org|\bdoi\s*:|\bdx\.doi|©|copyright|all rights reserved"
+    r"|available online|corresponding author|e-?mail)", re.I)
+_DANGLING_WORD_RE = re.compile(
+    r"\b(?:the|a|an|of|in|on|to|and|or|for|with|by|as|at|from|into|than|that|which"
+    r"|whose|where|when|while|because|between|among|within|without|about|over|under"
+    r"|during|after|before)\s*$", re.I)
+
 
 # 标题里允许出现的小词（用于"Title Case vs 整句"区分）
 _SMALL_WORDS = {"a", "an", "the", "and", "or", "of", "in", "on", "for", "with", "to", "from",
@@ -633,8 +650,129 @@ def _guess_title(blocks: list, body_size: float, page_h: float) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+def _is_caption_text(text: str) -> bool:
+    """图/表题：短、编号后接标题而不是小写动词（"Table 1 includes…" 是正文）。"""
+    if len(text) > 160:
+        return False
+    m = CAPTION_PREFIX_RE.match(text)
+    if not m:
+        return bool(CAPTION_RE.match(text)) and len(text) <= 80
+    rest = text[m.end():]
+    return (not rest) or not rest[0].islower()
+
+
+def _is_body_para(b: dict, body_size: float, ref_sections: set) -> bool:
+    """页末/页首候选正文段：排除表内文字、图/表题、脚注与版权/DOI 等页脚。"""
+    if b.get("type") != "para" or b.get("table_id"):
+        return False
+    if b.get("section_id") in ref_sections:
+        return False
+    text = (b.get("text") or "").strip()
+    if not text or _is_caption_text(text) or _PAGE_NOTE_RE.search(text):
+        return False
+    size = float(b.get("size") or 0)
+    if body_size and size and size < body_size * 0.95:
+        return False
+    return True
+
+
+def _continues_across_page(left: str, right: str) -> bool:
+    """判断后一页首段是否在续写上一页末段。"""
+    l = (left or "").rstrip()
+    r = (right or "").lstrip().lstrip("\"'“‘([")
+    if not l or not r:
+        return False
+    if re.search(r"[A-Za-z]-$", l) or l.endswith(("-", "–", "—")):
+        return True
+    if re.search(r"[,;:(\[\/]$", l):
+        return True
+    if re.search(r"[.!?][\"'”’)\]]*$", l):
+        return False
+    if r[:1].islower() or r[:1].isdigit():
+        return True
+    return bool(_DANGLING_WORD_RE.search(l))
+
+
+def _link_page_continuations(structure: dict) -> None:
+    """给跨页正文段落的后半块打 ``cont_of``；id/坐标不动，点击仍按页生效。"""
+    blocks = structure.get("blocks") or []
+    for b in blocks:
+        b.pop("cont_of", None)
+    if not blocks:
+        return
+    ref_sections = {s.get("id") for s in structure.get("sections") or []
+                    if s.get("is_references")}
+    # 按字符数加权取正文主字号：脚注、参考文献、表格文字块数多但字数少，
+    # 直接取中位数会被它们带偏（实测 8pt 正文会被拉到 7.2pt）。
+    sized = sorted((float(b.get("size") or 0), len(b.get("text") or "")) for b in blocks
+                   if b.get("type") == "para" and float(b.get("size") or 0) > 0)
+    total = sum(w for _, w in sized)
+    body_size, acc = 0.0, 0
+    for size, w in sized:
+        acc += w
+        if acc >= total / 2:
+            body_size = size
+            break
+    if not body_size and sized:
+        body_size = statistics.median([s for s, _ in sized])
+    by_page: dict[int, list] = {}
+    for b in blocks:
+        by_page.setdefault(int(b.get("page") or 0), []).append(b)
+
+    for page in sorted(by_page):
+        nxt = by_page.get(page + 1)
+        if not nxt:
+            continue
+        cur = by_page[page]
+        prev, prev_i = None, -1
+        for i, b in enumerate(cur):
+            if _is_body_para(b, body_size, ref_sections):
+                prev, prev_i = b, i
+        if prev is None:
+            continue
+        # 本页在候选段之后还有标题 → 段落已在页内结束，不是页末未完段
+        if any(b.get("type") == "heading" for b in cur[prev_i + 1:]):
+            continue
+
+        first = None
+        for b in nxt:
+            if b.get("type") == "heading":
+                break
+            if _is_body_para(b, body_size, ref_sections):
+                first = b
+                break
+        if first is None or first.get("section_id") != prev.get("section_id"):
+            continue
+        if _continues_across_page(prev.get("text", ""), first.get("text", "")):
+            first["cont_of"] = prev.get("id")
+
+
+def ensure_block_links(structure: dict, force: bool = False) -> bool:
+    """给老论文补/重算跨页段落链接，写 ``blocks_version``；返回是否有改动。"""
+    if not force and structure.get("blocks_version") == BLOCKS_VERSION:
+        return False
+    # 老论文可能只补过表格框、块上还没 table_id：先用已有表框重标一次，
+    # 避免把表格单元格当成页末正文拼进段落。
+    tables = structure.get("tables") or []
+    if tables:
+        try:
+            table_regions.tag_table_blocks(structure.get("blocks") or [], tables)
+        except Exception:
+            pass
+    _link_page_continuations(structure)
+    structure["blocks_version"] = BLOCKS_VERSION
+    return True
+
+
 def parse_pdf(path: str) -> dict:
     doc = pymupdf.open(path)
+    try:
+        return _parse_open_doc(doc)
+    finally:
+        doc.close()
+
+
+def _parse_open_doc(doc) -> dict:
     blocks: list[Block] = []
     sections: list[Section] = []
     bid, sid = 0, 0
@@ -872,8 +1010,7 @@ def parse_pdf(path: str) -> dict:
             tables_ok = (not layouts) or any(info is not None for info in layouts.values())
         except Exception:
             tables = []
-    doc.close()
-    return {
+    structure = {
         "title": title,
         "pages": n_pages,
         "blocks": blocks_out,
@@ -882,6 +1019,8 @@ def parse_pdf(path: str) -> dict:
         "tables": tables,
         "tables_version": table_regions.TABLES_VERSION if tables_ok else 0,
     }
+    ensure_block_links(structure)
+    return structure
 
 
 if __name__ == "__main__":

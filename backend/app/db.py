@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -27,12 +28,16 @@ os.makedirs(PDF_DIR, exist_ok=True)
 
 def _harden_permissions():
     """收紧本地数据目录/数据库权限，仅当前用户可读写（数据隐私）。"""
+    if os.name != "nt":
+        # 后面新建的 app.db-wal / app.db-shm / PDF 都只给当前用户读写
+        os.umask(0o077)
     for d, mode in ((DATA_DIR, 0o700), (PDF_DIR, 0o700)):
         try:
             os.chmod(d, mode)
         except OSError:
             pass
-    for f in (DB_PATH, os.path.join(os.path.dirname(DATA_DIR), ".env")):
+    for f in (DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm",
+              os.path.join(os.path.dirname(DATA_DIR), ".env")):
         try:
             if os.path.exists(f):
                 os.chmod(f, 0o600)
@@ -81,6 +86,8 @@ def init():
         pcols = {r[1] for r in c.execute("PRAGMA table_info(paper)")}
         if "folder_id" not in pcols:
             c.execute("ALTER TABLE paper ADD COLUMN folder_id TEXT")
+        if "parse_error" not in pcols:
+            c.execute("ALTER TABLE paper ADD COLUMN parse_error TEXT")
         cols = {r[1] for r in c.execute("PRAGMA table_info(paper_meta)")}
         if "note" not in cols:
             c.execute("ALTER TABLE paper_meta ADD COLUMN note TEXT")
@@ -92,29 +99,43 @@ def init():
             c.execute("ALTER TABLE paper_meta ADD COLUMN dismissed_terms TEXT")
         if "quiz" not in cols:
             c.execute("ALTER TABLE paper_meta ADD COLUMN quiz TEXT")
+        # 后台解析线程与请求线程会并发写库；WAL 让读不阻塞写，减少「database is locked」。
+        # 个别网络盘不支持 WAL，失败时保持默认 journal 模式。
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
 
 
 def new_paper_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def new_pending(filename, folder_id=None) -> str:
-    pid = new_paper_id()
+def new_pending(filename, folder_id=None, pdf_path: str = "", pid: str | None = None) -> str:
+    pid = pid or new_paper_id()
     with conn() as c:
-        c.execute("INSERT INTO paper(id,title,filename,pdf_path,pages,structure,analysis,status,created_at,folder_id)"
-                  " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (pid, "", filename, "", 0, "{}", None, "parsing", time.time(), folder_id or None))
+        c.execute("INSERT INTO paper(id,title,filename,pdf_path,pages,structure,analysis,status,created_at,folder_id,parse_error)"
+                  " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (pid, "", filename, pdf_path, 0, "{}", None, "parsing", time.time(), folder_id or None, None))
     return pid
 
 
-def set_status(pid, status):
+def set_parse_error(pid, message: str):
+    """解析失败：保留 PDF 与文件名，列表里可单独重试。"""
     with conn() as c:
-        c.execute("UPDATE paper SET status=? WHERE id=?", (status, pid))
+        c.execute("UPDATE paper SET status=?, parse_error=? WHERE id=?",
+                  ("error", (message or "解析失败")[:1000], pid))
+
+
+def mark_parsing(pid):
+    """重试前把状态改回解析中，并清掉上一次的错误。"""
+    with conn() as c:
+        c.execute("UPDATE paper SET status=?, parse_error=NULL WHERE id=?", ("parsing", pid))
 
 
 def finish_paper(pid, title, pdf_path, structure):
     with conn() as c:
-        c.execute("UPDATE paper SET title=?, pdf_path=?, pages=?, structure=?, status=? WHERE id=?",
+        c.execute("UPDATE paper SET title=?, pdf_path=?, pages=?, structure=?, status=?, parse_error=NULL WHERE id=?",
                   (title, pdf_path, structure["pages"], json.dumps(structure, ensure_ascii=False),
                    "parsed", pid))
 
@@ -124,6 +145,11 @@ def set_structure(pid, structure):
     with conn() as c:
         c.execute("UPDATE paper SET structure=? WHERE id=?",
                   (json.dumps(structure, ensure_ascii=False), pid))
+
+
+def paper_exists(pid) -> bool:
+    with conn() as c:
+        return c.execute("SELECT 1 FROM paper WHERE id=?", (pid,)).fetchone() is not None
 
 
 def get_paper(pid) -> dict | None:
@@ -140,7 +166,8 @@ def get_paper(pid) -> dict | None:
 def list_papers() -> list[dict]:
     with conn() as c:
         rows = c.execute(
-            "SELECT p.id,p.title,p.filename,p.pages,p.status,p.created_at,p.folder_id,"
+            "SELECT p.id,p.title,p.filename,p.pages,p.status,p.parse_error,p.created_at,p.folder_id,"
+            " CASE WHEN p.analysis IS NOT NULL AND p.analysis<>'' THEN 1 ELSE 0 END AS has_analysis,"
             " COALESCE(m.visited,0) AS visited, COALESCE(m.collected,0) AS collected,"
             " m.domain AS domain, m.note AS note, f.name AS folder_name"
             " FROM paper p LEFT JOIN paper_meta m ON m.paper_id=p.id"
@@ -163,6 +190,11 @@ def get_setting(k, default=None):
 def set_setting(k, v):
     with conn() as c:
         c.execute("INSERT OR REPLACE INTO setting VALUES(?,?)", (k, v))
+
+
+def delete_setting(k):
+    with conn() as c:
+        c.execute("DELETE FROM setting WHERE k=?", (k,))
 
 
 # ---------------- 模型提供商 ----------------
@@ -328,6 +360,8 @@ def delete_folder(fid, delete_papers: bool = True) -> list[str] | None:
             for r in rows:
                 if r["pdf_path"]:
                     paths.append(r["pdf_path"])
+                # 旧库的绝对路径可能已失效：按 id 再补一份实际文件位置
+                paths.append(os.path.join(PDF_DIR, f"{r['id']}.pdf"))
                 c.execute("DELETE FROM card WHERE paper_id=?", (r["id"],))
                 c.execute("DELETE FROM highlight WHERE paper_id=?", (r["id"],))
                 c.execute("DELETE FROM paper_meta WHERE paper_id=?", (r["id"],))
@@ -350,7 +384,11 @@ def copy_paper(pid, folder_id, new_pid: str, new_pdf_path: str) -> str | None:
     if not src:
         return None
     title = (src.get("title") or src.get("filename") or "").strip()
-    if not title.endswith("（副本）"):
+    # 副本的副本不要叫成同一个名字：X（副本）→ X（副本 2）
+    m = re.match(r"^(.*?)（副本(?: (\d+))?）$", title)
+    if m:
+        title = f"{m.group(1)}（副本 {int(m.group(2) or 1) + 1}）"
+    else:
         title = f"{title}（副本）"
     now = time.time()
     with conn() as c:
@@ -407,19 +445,6 @@ def add_highlight(pid, page: int, color: str, text: str, rects: list) -> str:
     return hid
 
 
-def get_highlight(hid) -> dict | None:
-    with conn() as c:
-        r = c.execute("SELECT * FROM highlight WHERE id=?", (hid,)).fetchone()
-    if not r:
-        return None
-    d = dict(r)
-    try:
-        d["rects"] = json.loads(d["rects"]) if d.get("rects") else []
-    except (TypeError, ValueError):
-        d["rects"] = []
-    return d
-
-
 def set_highlight_color(hid, color: str) -> bool:
     with conn() as c:
         cur = c.execute("UPDATE highlight SET color=? WHERE id=?", (color, hid))
@@ -469,23 +494,42 @@ def get_meta(pid) -> dict | None:
     return _row_meta(r) if r else None
 
 
+_META_FIELDS = {"domain", "familiarity", "known_terms", "plan", "note", "quiz_score",
+                "visited", "collected", "domain_guess", "dismissed_terms", "quiz"}
+
+
 def upsert_meta(pid, **fields):
-    cur = get_meta(pid) or {}
-    merged = {**{k: cur.get(k) for k in
-                 ("domain", "familiarity", "known_terms", "plan", "note", "quiz_score",
-                  "visited", "collected", "domain_guess", "dismissed_terms", "quiz")}, **fields}
+    """只更新传入的列。
+
+    旧实现先读整行再 INSERT OR REPLACE：两个请求并发时后写的会用旧快照覆盖前一个
+    请求刚写入的字段（例如判分结果被 mark_visited 抹掉）。这里改成逐列 upsert。
+    """
+    payload = {}
+    for k, v in fields.items():
+        if k not in _META_FIELDS:
+            continue
+        if k in ("known_terms", "dismissed_terms"):
+            if isinstance(v, str):
+                v = [v]
+            v = json.dumps(v if isinstance(v, list) else [], ensure_ascii=False)
+        elif k in ("plan", "domain_guess", "quiz"):
+            v = json.dumps(v, ensure_ascii=False) if v else None
+        elif k in ("visited", "collected"):
+            v = 1 if v else 0
+        payload[k] = v
+    if not payload:
+        return get_meta(pid)
+    cols = ["paper_id", *payload.keys(), "updated_at"]
+    vals = [pid, *payload.values(), time.time()]
+    updates = ", ".join(f"{k}=excluded.{k}" for k in payload)
     with conn() as c:
-        c.execute("INSERT OR REPLACE INTO paper_meta"
-                  "(paper_id,domain,familiarity,known_terms,plan,note,quiz_score,visited,collected,updated_at,domain_guess,dismissed_terms,quiz)"
-                  " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (pid, merged.get("domain"), merged.get("familiarity"),
-                   json.dumps(merged.get("known_terms") or [], ensure_ascii=False),
-                   json.dumps(merged.get("plan"), ensure_ascii=False) if merged.get("plan") else None,
-                   merged.get("note"), merged.get("quiz_score"),
-                   1 if merged.get("visited") else 0, 1 if merged.get("collected") else 0, time.time(),
-                   json.dumps(merged.get("domain_guess"), ensure_ascii=False) if merged.get("domain_guess") else None,
-                   json.dumps(merged.get("dismissed_terms") or [], ensure_ascii=False),
-                   json.dumps(merged.get("quiz"), ensure_ascii=False) if merged.get("quiz") else None))
+        # WHERE EXISTS 让「论文存在」判断与写入同一条 SQL 完成，避免删论文的竞态留下孤儿 meta
+        c.execute(
+            f"INSERT INTO paper_meta({','.join(cols)})"
+            f" SELECT {','.join('?' for _ in cols)}"
+            f" WHERE EXISTS(SELECT 1 FROM paper WHERE id=?)"
+            f" ON CONFLICT(paper_id) DO UPDATE SET {updates}, updated_at=excluded.updated_at",
+            (*vals, pid))
     return get_meta(pid)
 
 

@@ -46,6 +46,12 @@ APP_NAME = "paper-companion"
 # 公式 OCR 模型：public/models 下是源码副本，构建时由 vite 复制进 dist
 MODEL_DIR = os.path.join(FRONTEND, "public", "models", "formulanet")
 MODEL_FILES = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "NOTICE.txt",
     os.path.join("onnx", "encoder_model.onnx"),
     os.path.join("onnx", "decoder_model_merged.onnx"),
 )
@@ -290,48 +296,57 @@ def make_release(built: str, target: str) -> tuple[str, str | None]:
     stage = os.path.join(RELEASE, f"{APP_NAME}-{target}")
     os.makedirs(RELEASE, exist_ok=True)
     kept_data = None
-    if os.path.isdir(stage):
-        # release 目录常被直接当运行目录，重建时先把它旁边的 data/ 挪出来，避免误删用户数据
-        data_dir = os.path.join(stage, "data")
-        if os.path.isdir(data_dir):
-            kept_data = os.path.join(RELEASE, f"{APP_NAME}-{target}.data-keep-{int(time.time())}")
-            os.rename(data_dir, kept_data)
-            print(f"提示：已暂存用户数据目录 -> {kept_data}")
-        try:
-            shutil.rmtree(stage)
-        except PermissionError:
-            # 旧目录里有程序正在运行（data/app.db 被占用），挪到一边，不阻塞新构建
-            aside = f"{stage}.old-{int(time.time())}"
-            os.rename(stage, aside)
-            print(f"提示：旧目录被占用，已移动到 {aside}")
+    try:
+        if os.path.isdir(stage):
+            # release 目录常被直接当运行目录，重建时先把它旁边的 data/ 挪出来，避免误删用户数据
+            data_dir = os.path.join(stage, "data")
+            if os.path.isdir(data_dir):
+                kept_data = os.path.join(RELEASE, f"{APP_NAME}-{target}.data-keep-{int(time.time())}")
+                os.rename(data_dir, kept_data)
+                print(f"提示：已暂存用户数据目录 -> {kept_data}")
+            try:
+                shutil.rmtree(stage)
+            except PermissionError:
+                # 旧目录里有程序正在运行（data/app.db 被占用），挪到一边，不阻塞新构建
+                aside = f"{stage}.old-{int(time.time())}"
+                os.rename(stage, aside)
+                print(f"提示：旧目录被占用，已移动到 {aside}")
 
-    # Windows 上杀毒软件可能短时间锁住刚生成的文件，失败重试几次
-    for attempt in range(3):
-        try:
-            shutil.copytree(built, stage)
-            break
-        except PermissionError:
-            if attempt == 2:
-                raise
-            time.sleep(2)
+        # Windows 上杀毒软件可能短时间锁住刚生成的文件，失败重试几次
+        for attempt in range(3):
+            try:
+                shutil.copytree(built, stage)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(2)
 
-    if target.startswith("win"):
-        with open(os.path.join(stage, "start.bat"), "w", encoding="utf-8") as f:
-            f.write(LAUNCHER_WIN)
-    elif target.startswith("macos"):
-        path = os.path.join(stage, "start.command")
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(LAUNCHER_UNIX)
-        os.chmod(path, 0o755)
-    else:
-        path = os.path.join(stage, "start.sh")
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(LAUNCHER_UNIX)
-        os.chmod(path, 0o755)
+        if target.startswith("win"):
+            with open(os.path.join(stage, "start.bat"), "w", encoding="utf-8") as f:
+                f.write(LAUNCHER_WIN)
+        elif target.startswith("macos"):
+            path = os.path.join(stage, "start.command")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(LAUNCHER_UNIX)
+            os.chmod(path, 0o755)
+        else:
+            path = os.path.join(stage, "start.sh")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(LAUNCHER_UNIX)
+            os.chmod(path, 0o755)
 
-    with open(os.path.join(stage, "README.txt"), "w", encoding="utf-8") as f:
-        f.write(README)
-    # 注意：这里不还原 data/，要等打包完成后再放回，避免把用户数据和 Key 打进发行包
+        with open(os.path.join(stage, "README.txt"), "w", encoding="utf-8") as f:
+            f.write(README)
+        # 注意：这里不还原 data/，要等打包完成后再放回，避免把用户数据和 Key 打进发行包
+    except Exception:
+        # 数据已经从 stage 移走：失败时先放回去，避免用户以为论文全丢了
+        if kept_data and os.path.isdir(kept_data):
+            try:
+                os.rename(kept_data, os.path.join(stage, "data"))
+            except OSError:
+                pass
+        raise
     return stage, kept_data
 
 
@@ -343,10 +358,15 @@ def archive(stage: str, target: str) -> str:
 
     if target.startswith("linux"):
         out = os.path.join(RELEASE, f"{APP_NAME}-{target}.tar.gz")
+        base_name = os.path.basename(stage)
+        data_entry = f"{base_name}/data"
         with tarfile.open(out, "w:gz") as tar:
             def filt(info: tarfile.TarInfo):
-                return None if skip_personal_data(info.name) else info
-            tar.add(stage, arcname=os.path.basename(stage), filter=filt)
+                # tar 成员名是「目录名/data/...」而不是绝对路径，不能复用 skip_personal_data
+                if info.name == data_entry or info.name.startswith(data_entry + "/"):
+                    return None
+                return info
+            tar.add(stage, arcname=base_name, filter=filt)
     else:
         out = os.path.join(RELEASE, f"{APP_NAME}-{target}.zip")
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
@@ -379,14 +399,20 @@ def main() -> None:
     ensure_dist_model(args.allow_missing_model)
     built = build_backend()
     stage, kept_data = make_release(built, target)
-    out = archive(stage, target)
-    size_mb = os.path.getsize(out) / 1024 / 1024
-    print(f"\n完成：{out}（{size_mb:.1f} MB）")
-
-    # 发行包生成后再把本地用户数据放回目录，本地运行时数据仍在
-    if kept_data and os.path.isdir(kept_data):
-        os.rename(kept_data, os.path.join(stage, "data"))
-        print("提示：用户数据已放回本地目录（未进入发行包）")
+    try:
+        out = archive(stage, target)
+        size_mb = os.path.getsize(out) / 1024 / 1024
+        print(f"\n完成：{out}（{size_mb:.1f} MB）")
+    finally:
+        # 不管打包成功还是中途失败，都把本地用户数据放回原目录
+        if kept_data and os.path.isdir(kept_data):
+            target_data = os.path.join(stage, "data")
+            try:
+                if not os.path.exists(target_data):
+                    os.rename(kept_data, target_data)
+                    print("提示：用户数据已放回本地目录（未进入发行包）")
+            except OSError as exc:
+                print(f"警告：用户数据暂存在 {kept_data}，请手动移回 {target_data}（{exc}）")
 
 
 if __name__ == "__main__":

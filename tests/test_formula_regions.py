@@ -60,7 +60,7 @@ def test_keep_box_filters_small_and_pictured():
     assert not fr.keep_box((10, 10, 200, 700), [], 800)    # 高过页面的 55%
 
 
-def test_heuristic_flag_off_disables_layout(monkeypatch_env=None):
+def test_heuristic_flag_off_disables_layout():
     """PC_FORMULA_LAYOUT=off 时不应尝试版面模型。"""
     old = os.environ.get("PC_FORMULA_LAYOUT")
     os.environ["PC_FORMULA_LAYOUT"] = "off"

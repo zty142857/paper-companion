@@ -30,7 +30,6 @@ export interface FormulaRegion {
 }
 export interface ViewerHandle {
   scrollToPage: (n: number) => void
-  hitTest: (x: number, y: number, blocks: HitBlock[]) => string | null
   blockTop: (page: number, y0: number, rail: HTMLElement) => number | null
   flashText: (page: number, query: string) => boolean
   selectionImage: (sel: SelectedText, padding?: number) => Promise<Blob | null>
@@ -206,6 +205,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   tables = [], onTableClick }: Props) {
   const box = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(DEFAULT_SCALE)
+  const [displayScale, setDisplayScale] = useState(scale)
   const [err, setErr] = useState('')
   const renderTimer = useRef<number | null>(null)
   const pageEls = useRef(new Map<number, { el: HTMLDivElement; scale: number }>())
@@ -223,6 +223,8 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   formulaRegionsRef.current = formulaRegions
   const tablesRef = useRef<TableBox[]>(tables)
   tablesRef.current = tables
+  const onLayoutRef = useRef(onLayout)
+  onLayoutRef.current = onLayout
   const [formulaMode, setFormulaMode] = useState(false)
   const formulaDrag = useRef<{
     page: number; el: HTMLDivElement; box: HTMLDivElement
@@ -652,14 +654,17 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
 
   useEffect(() => {
     let dead = false
+    let task: ReturnType<typeof pdfjs.getDocument> | null = null
     const wrap = box.current!
     wrap.innerHTML = ''
     pageEls.current = new Map()
-      setErr('')
-    pdfjs.getDocument({ url, wasmUrl: WASM_URL }).promise.then(async (doc) => {
+    setErr('')
+    task = pdfjs.getDocument({ url, wasmUrl: WASM_URL })
+    task.promise.then(async (doc) => {
       if (dead) return
       docRef.current = doc
       const first = await doc.getPage(1)
+      if (dead) return
       baseW.current = first.getViewport({ scale: 1 }).width
       if (fittedUrl.current !== url) {
         fittedUrl.current = url
@@ -673,6 +678,8 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       for (let i = 1; i <= doc.numPages; i++) {
         if (dead) return
         const page = await doc.getPage(i)
+        // 等待期间可能已经触发新的缩放/换文档；这时不能再往共享的 wrap 里插旧页
+        if (dead) return
         const vp = page.getViewport({ scale })   // 不裁剪：允许超过阅读区宽度而横向滚动
         const div = document.createElement('div')
         div.className = 'page'
@@ -713,12 +720,15 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
           div.appendChild(note)
         }
         note.remove()   // 成功或失败都撤掉"渲染中"提示
+        if (dead) return
         try {
+          const textContent = await page.streamTextContent()
+          if (dead) return
           const tl = new pdfjs.TextLayer({
-            textContentSource: await page.streamTextContent(), container: tlDiv, viewport: vp,
+            textContentSource: textContent, container: tlDiv, viewport: vp,
           })
           await tl.render()
-          textLayers.current.push(tl)
+          if (!dead) textLayers.current.push(tl)
         } catch { /* 文字层失败不影响图像展示 */ }
       }
       pdfjs.TextLayer.cleanup()
@@ -728,14 +738,22 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
         const shown = failed.slice(0, 6).join('、')
         setErr(`${failed.length}/${doc.numPages} 页渲染失败（第 ${shown}${failed.length > 6 ? ' 等' : ''} 页），其余页正常`)
       }
-      onLayout?.()
+      if (!dead) onLayoutRef.current?.()
     }).catch((e) => { if (!dead) setErr(String(e?.message || e)) })
     return () => {
       dead = true
       docRef.current = null
       textLayers.current.forEach((t) => t.cancel())
       textLayers.current = []
+      // pdf.js 的文档缓存和 worker 不会随 DOM 清空自动释放；缩放会重建整个文档，不销毁会持续涨内存。
+      // v6 的 PDFDocumentProxy 没有公开 destroy()，必须销毁 loadingTask。
+      if (task) void task.destroy().catch(() => {})
     }
+  }, [url, scale])
+
+  // 重新渲染（缩放/换文档）时丢掉旧的拖拽框，避免引用已卸载的 page 元素
+  useEffect(() => {
+    cancelFormulaDrag()
   }, [url, scale])
 
   // 退出公式框选模式 / 按 Esc 时清掉未完成的拖拽框
@@ -776,7 +794,6 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   }, [])
 
   // 滑块连续拖动：先即时更新百分比，停止拖动 200ms 后再重排渲染
-  const [displayScale, setDisplayScale] = useState(scale)
   const autoFit = useRef(true)      // 处于「适配」模式时，窗口变化后自动重算
   const scaleRef = useRef(scale)
   scaleRef.current = scale
@@ -815,7 +832,6 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
         pe.el.classList.add('flash')
         setTimeout(() => pe.el.classList.remove('flash'), 1400)
       },
-      hitTest: (x, y, bs) => hitIn(pageEls.current, bs, x, y),
       blockTop: (page, y0, rail) => {
         const pe = pageEls.current.get(page)
         if (!pe) return null
@@ -963,7 +979,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
         <span style={{ fontSize: 12, color: 'var(--muted)', width: 42, textAlign: 'right' }}>
           {Math.round(displayScale * 100)}%</span>
         <span className="zoombar-hint" style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 'auto', marginRight: 8 }}>
-          {formulaMode ? '拖拽框住一个公式，松开自动识别；Esc 取消' : '拖选文字可标亮 · 点击段落可翻译 / 提问'}
+          {formulaMode ? '拖拽框住一个公式，松开自动识别；Esc 取消' : '拖选文字可标亮 / 翻译 · 点击段落可翻译 / 提问'}
         </span>
         {err && <span className="err">渲染失败：{err}</span>}
       </div>

@@ -15,6 +15,9 @@ export default function PlanCard({ pid, plan, onUpdate, onRegenerate, onClose, o
   const [skip, setSkip] = useState<string[]>(plan.skip ?? [])
   const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false)
+  const focusItems = Array.isArray(plan.focus) ? plan.focus : []
+  const skipItems = Array.isArray(plan.skip) ? plan.skip : []
+  const suggestions = Array.isArray(plan.suggestions) ? plan.suggestions : []
 
   const toggle = (arr: string[], set: (v: string[]) => void, v: string) =>
     set(arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v])
@@ -49,29 +52,30 @@ export default function PlanCard({ pid, plan, onUpdate, onRegenerate, onClose, o
         <button className="x" onClick={onClose}>✕</button>
       </div>
       <div className="pb">
-        {plan.summary && <div className="psum">{plan.summary}</div>}
+        {typeof plan.summary === 'string' && plan.summary && <div className="psum">{plan.summary}</div>}
         <div className="prow"><b>重点关注</b><span className="hint">（勾选决定我强调哪些）</span></div>
         <div className="chips">
-          {plan.focus.map((f) => (
+          {focusItems.map((f) => (
             <button key={f} className={`chip${focus.includes(f) ? ' on' : ''}`}
               onClick={() => toggle(focus, setFocus, f)}>{focus.includes(f) ? '✓ ' : ''}{f}</button>
           ))}
         </div>
-        {!!plan.skip.length && <>
+        {!!skipItems.length && <>
           <div className="prow"><b>建议略读</b></div>
           <div className="chips">
-            {plan.skip.map((s) => (
+            {skipItems.map((s) => (
               <button key={s} className={`chip${skip.includes(s) ? ' on' : ''}`}
                 onClick={() => toggle(skip, setSkip, s)}>{skip.includes(s) ? '✓ ' : ''}{s}</button>
             ))}
           </div>
         </>}
         <div className="pmeta">
-          <div>{depthLabel[plan.term_depth] ?? plan.term_depth}</div>
-          <div>摘要侧重：{plan.abstract_emphasis}</div>
+          <div>{typeof plan.term_depth === 'string'
+            ? (depthLabel[plan.term_depth] ?? plan.term_depth) : ''}</div>
+          <div>摘要侧重：{typeof plan.abstract_emphasis === 'string' ? plan.abstract_emphasis : ''}</div>
         </div>
-        {!!plan.suggestions.length && <ul className="psug">
-          {plan.suggestions.map((s) => <li key={s}>{s}</li>)}
+        {!!suggestions.length && <ul className="psug">
+          {suggestions.map((s) => <li key={s}>{s}</li>)}
         </ul>}
         <div className="prow" style={{ justifyContent: 'flex-end', alignItems: 'center' }}>
           {saved && <span className="ok">✓ 已按此计划保存</span>}

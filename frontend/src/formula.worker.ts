@@ -147,9 +147,16 @@ async function recognize(id: string, blob: Blob) {
   await init(id)
   if (!model || !tokenizer) throw new Error('公式模型未加载')
   const input = await imageToTensor(blob)
-  const output = await (model as any).generate({ inputs: input })
-  const text = tokenizer.batch_decode(output, { skip_special_tokens: true })[0] || ''
-  return text.trim()
+  let output: any = null
+  try {
+    output = await (model as any).generate({ inputs: input })
+    const text = tokenizer.batch_decode(output, { skip_special_tokens: true })[0] || ''
+    return text.trim()
+  } finally {
+    // onnxruntime 的 Tensor 不会自动 GC：每次识别都新建输入张量，不释放会持续吃 WASM 内存
+    ;(input as any).dispose?.()
+    ;(output as any)?.dispose?.()
+  }
 }
 
 self.onmessage = async (event: MessageEvent<{ type: string; id: string; image: Blob }>) => {
