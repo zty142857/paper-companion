@@ -25,7 +25,8 @@ jobs:
           # macOS Intel（macos-x64）暂无法构建：PyMuPDF 2.0 只发布 arm64 的 macOS wheel
           # （onnxruntime 同样已停止发布 macOS x86_64 wheel），版面/表格功能依赖它，
           # 强行从源码编译 MuPDF 也不现实。恢复构建前先确认上游恢复 x86_64 支持。
-          - os: macos-14
+          # macOS 14 runner 已于 2026-11-02 退役，改用受支持的 macOS 15（arm64）
+          - os: macos-15
             target: macos-arm64
 
     steps:
