@@ -91,7 +91,7 @@ JUNK_META_RE = re.compile(
 # 跨页段落链接：后一页的正文块若明显是上一页段落的续写，就在它上面记 cont_of。
 # 只认"上一页段末还没说完 + 下一页以小写/数字继续"或上一行以断词连字符、
 # 逗号、悬空功能词收尾的情况，避免把正常的新段落硬拼在一起。
-BLOCKS_VERSION = 1
+BLOCKS_VERSION = 2
 _PAGE_NOTE_RE = re.compile(
     r"(https?://|www\.|doi\.org|\bdoi\s*:|\bdx\.doi|©|copyright|all rights reserved"
     r"|available online|corresponding author|e-?mail)", re.I)
@@ -99,6 +99,10 @@ _DANGLING_WORD_RE = re.compile(
     r"\b(?:the|a|an|of|in|on|to|and|or|for|with|by|as|at|from|into|than|that|which"
     r"|whose|where|when|while|because|between|among|within|without|about|over|under"
     r"|during|after|before)\s*$", re.I)
+# 旧结构里页脚有时被并进正文块；判断跨页续写时先把尾部资助/版权文字剥掉。
+_FOOTER_TRAIL_RE = re.compile(
+    r"\s+(?=(?:This (?:work|research|study) (?:is|was) (?:supported|funded)"
+    r"|Funding\s*:|©|Copyright|Corresponding author\s*:))", re.I)
 
 
 # 标题里允许出现的小词（用于"Title Case vs 整句"区分）
@@ -372,6 +376,7 @@ class Block:
     size: float = 0.0
     text: str = ""
     section_id: str | None = None
+    footer: bool = False
 
 
 @dataclass
@@ -455,16 +460,19 @@ def _clean_lines(block, body_size: float) -> list:
     return merged
 
 
-def _split_block_to_items(lines: list, body_size: float, top_zone: bool) -> list:
+def _split_block_to_items(lines: list, body_size: float, top_zone: bool,
+                          page_h: float = 0.0) -> list:
     """把一个文本块的行序列切成 [("head", text, level, lines) / ("para", lines)] 片段。
 
     标题可出现在块的任意位置（PyMuPDF 常把相邻标题/正文合并成一个块）；
-    标题若换行（下一行是短的 Title Case 片段，且其后是长正文或另一个标题），合并为一条标题。"""
+    标题若换行（下一行是短的 Title Case 片段，且其后是长正文或另一个标题），合并为一条标题。
+    页脚小字也常和最后一段落在同一个文本块里，遇到底部的小字号行时先切开。"""
     segs, para, i = [], [], 0
+    footer_style, footer_cut = False, 0.0
 
     def flush():
         if para:
-            segs.append(("para", list(para)))
+            segs.append(("footer" if footer_style else "para", list(para)))
             para.clear()
 
     def head_of(idx):
@@ -485,6 +493,16 @@ def _split_block_to_items(lines: list, body_size: float, top_zone: bool) -> list
 
     while i < len(lines):
         ln = lines[i]
+        bottom_small = bool(page_h and ln.get("bbox", (0, 0, 0, 0))[1] > page_h * 0.86)
+        if para and not footer_style and bottom_small:
+            ref = max(l.get("size", 0) for l in para)
+            if ref and ln.get("size", 0) < ref * 0.90:
+                flush()
+                footer_style = True
+                footer_cut = ref * 0.90
+        elif footer_style and ln.get("size", 0) >= footer_cut:
+            flush()
+            footer_style = False
         res = head_of(i)
         if res:
             flush()
@@ -661,6 +679,20 @@ def _is_caption_text(text: str) -> bool:
     return (not rest) or not rest[0].islower()
 
 
+def _weighted_median_size(sized: list[tuple[float, int]]) -> float:
+    """按文本字符数加权的字号中位数；脚注、图注和表格小字占比低，不会把正文基准带偏。"""
+    vals = sorted((float(s), int(w)) for s, w in sized if float(s or 0) > 0 and int(w or 0) > 0)
+    if not vals:
+        return 0.0
+    total = sum(w for _, w in vals)
+    acc = 0
+    for size, weight in vals:
+        acc += weight
+        if acc >= total / 2:
+            return size
+    return statistics.median([s for s, _ in vals])
+
+
 def _is_body_para(b: dict, body_size: float, ref_sections: set) -> bool:
     """页末/页首候选正文段：排除表内文字、图/表题、脚注与版权/DOI 等页脚。"""
     if b.get("type") != "para" or b.get("table_id"):
@@ -679,6 +711,8 @@ def _is_body_para(b: dict, body_size: float, ref_sections: set) -> bool:
 def _continues_across_page(left: str, right: str) -> bool:
     """判断后一页首段是否在续写上一页末段。"""
     l = (left or "").rstrip()
+    # 兼容旧解析结果：页脚被并进正文块时，用它前面的正文判断续写。
+    l = _FOOTER_TRAIL_RE.split(l, maxsplit=1)[0].rstrip()
     r = (right or "").lstrip().lstrip("\"'“‘([")
     if not l or not r:
         return False
@@ -704,17 +738,9 @@ def _link_page_continuations(structure: dict) -> None:
                     if s.get("is_references")}
     # 按字符数加权取正文主字号：脚注、参考文献、表格文字块数多但字数少，
     # 直接取中位数会被它们带偏（实测 8pt 正文会被拉到 7.2pt）。
-    sized = sorted((float(b.get("size") or 0), len(b.get("text") or "")) for b in blocks
-                   if b.get("type") == "para" and float(b.get("size") or 0) > 0)
-    total = sum(w for _, w in sized)
-    body_size, acc = 0.0, 0
-    for size, w in sized:
-        acc += w
-        if acc >= total / 2:
-            body_size = size
-            break
-    if not body_size and sized:
-        body_size = statistics.median([s for s, _ in sized])
+    body_size = _weighted_median_size(
+        [(float(b.get("size") or 0), len(b.get("text") or "")) for b in blocks
+         if b.get("type") == "para" and float(b.get("size") or 0) > 0])
     by_page: dict[int, list] = {}
     for b in blocks:
         by_page.setdefault(int(b.get("page") or 0), []).append(b)
@@ -847,7 +873,9 @@ def _parse_open_doc(doc) -> dict:
             if not lines:
                 continue
             top_zone = pno == 0 and lines[0]["bbox"][1] < h * 0.30  # 首页标题/作者/机构区
-            for seg in _split_block_to_items(lines, body_size, top_zone):
+            for seg in _split_block_to_items(lines, body_size, top_zone, h):
+                if seg[0] == "footer":
+                    continue
                 if seg[0] == "head":
                     _, text, lvl, grp = seg
                     bbox = _union_bbox(grp)
@@ -949,7 +977,10 @@ def _parse_open_doc(doc) -> dict:
             bid += 1
             b = Block(id=f"b{bid}", page=pno + 1, col=col, type=kind,
                       y0=round(bbox[1], 1), y1=round(bbox[3], 1),
-                      x0=round(bbox[0], 1), x1=round(bbox[2], 1), size=round(fsize, 1), text=text)
+                      x0=round(bbox[0], 1), x1=round(bbox[2], 1), size=round(fsize, 1), text=text,
+                      footer=bool(kind == "para" and body_size
+                                  and fsize < body_size * 0.90
+                                  and bbox[1] > h * 0.86))
             if kind == "heading":
                 last_head = text.strip().lower()
                 sid += 1

@@ -65,6 +65,7 @@ jobs:
           python tests/test_formula_regions.py
           python tests/test_page_continuation.py
           python tests/test_translate_selection.py
+          python tests/test_inline_translation.py
           python tests/test_table_regions.py
           python tests/test_model_settings.py
 
@@ -143,6 +144,10 @@ jobs:
           解压即用，**不需要安装 Python 或 Node**。
 
           ### 本版亮点
+          - **原位翻译**：点击段落直接覆盖显示中文，顶栏统一在原文 / 译文间切换；译文过宽过长时按完整行截断并用行尾小三角展开
+          - **章节批量翻译**：章节导航右键即可按章节及子章节顺序翻译，实时显示进度，可停止、失败重试；已有译文默认复用
+          - **翻译缓存与失败保护**：译文按块持久化，重新翻译失败不会覆盖已有好译文，失败结果不会写入缓存
+          - **排版与解析修复**：正文译文统一基准字号；页脚小字不再并入正文，修复页脚导致的跨页段落无法合并问题
           - **批量上传**：一次拖入或选择多篇 PDF，后台逐篇解析，某篇失败可单独重试，不影响其余论文
           - **划词翻译**：拖选正文点「译」，选区旁即时显示译文，自动结合所在段落理解语境
           - **跨页段落合并**：段落跨页时翻译 / 追问 / 导读不再只拿到半段，页码显示「第 N–M 页」

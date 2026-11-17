@@ -81,6 +81,9 @@ def init():
         CREATE TABLE IF NOT EXISTS provider(
           id TEXT PRIMARY KEY, name TEXT, base_url TEXT, api_key TEXT, headers TEXT,
           catalog_id TEXT, models TEXT, created_at REAL);
+        CREATE TABLE IF NOT EXISTS translation(
+          paper_id TEXT, block_id TEXT, translation TEXT, created_at REAL, updated_at REAL,
+          PRIMARY KEY(paper_id, block_id));
         """)
         # 轻量迁移：旧库补列
         pcols = {r[1] for r in c.execute("PRAGMA table_info(paper)")}
@@ -298,6 +301,35 @@ def delete_card(cid):
         c.execute("DELETE FROM card WHERE id=?", (cid,))
 
 
+# ---------- 原位翻译缓存：按 paper_id + block_id 永久保存 ----------
+
+def get_translations(paper_id) -> dict[str, str]:
+    with conn() as c:
+        rows = c.execute("SELECT block_id,translation FROM translation WHERE paper_id=?"
+                         " ORDER BY created_at", (paper_id,)).fetchall()
+    return {r["block_id"]: r["translation"] for r in rows}
+
+
+def get_translation(paper_id, block_id) -> str | None:
+    with conn() as c:
+        r = c.execute("SELECT translation FROM translation WHERE paper_id=? AND block_id=?",
+                      (paper_id, block_id)).fetchone()
+    return r["translation"] if r else None
+
+
+def save_translation(paper_id, block_id, translation: str) -> bool:
+    """写入原位译文；论文已被删除时静默不写，避免留下孤儿缓存。"""
+    now = time.time()
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO translation(paper_id,block_id,translation,created_at,updated_at)"
+            " SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM paper WHERE id=?)"
+            " ON CONFLICT(paper_id,block_id) DO UPDATE SET"
+            " translation=excluded.translation, updated_at=excluded.updated_at",
+            (paper_id, block_id, translation, now, now, paper_id))
+    return cur.rowcount > 0
+
+
 def delete_paper(pid) -> str | None:
     p = get_paper(pid)
     if not p:
@@ -306,6 +338,7 @@ def delete_paper(pid) -> str | None:
         c.execute("DELETE FROM card WHERE paper_id=?", (pid,))
         c.execute("DELETE FROM highlight WHERE paper_id=?", (pid,))
         c.execute("DELETE FROM paper_meta WHERE paper_id=?", (pid,))
+        c.execute("DELETE FROM translation WHERE paper_id=?", (pid,))
         c.execute("DELETE FROM paper WHERE id=?", (pid,))
     return p.get("pdf_path") or None
 
@@ -350,7 +383,7 @@ def rename_folder(fid, name: str) -> bool:
 
 
 def delete_folder(fid, delete_papers: bool = True) -> list[str] | None:
-    """删除文件夹。delete_papers=True 时连同论文/卡片/笔记/标亮一起删除，返回待删 PDF 路径。"""
+    """删除文件夹。delete_papers=True 时连同论文/卡片/笔记/标亮/译文一起删除，返回待删 PDF 路径。"""
     if not get_folder(fid):
         return None
     paths: list[str] = []
@@ -365,6 +398,7 @@ def delete_folder(fid, delete_papers: bool = True) -> list[str] | None:
                 c.execute("DELETE FROM card WHERE paper_id=?", (r["id"],))
                 c.execute("DELETE FROM highlight WHERE paper_id=?", (r["id"],))
                 c.execute("DELETE FROM paper_meta WHERE paper_id=?", (r["id"],))
+                c.execute("DELETE FROM translation WHERE paper_id=?", (r["id"],))
                 c.execute("DELETE FROM paper WHERE id=?", (r["id"],))
         else:
             c.execute("UPDATE paper SET folder_id=NULL WHERE folder_id=?", (fid,))
@@ -379,7 +413,7 @@ def move_paper(pid, folder_id) -> bool:
 
 
 def copy_paper(pid, folder_id, new_pid: str, new_pdf_path: str) -> str | None:
-    """把论文复制成一份完全独立的副本（结构/导读/卡片/笔记/标亮/画像/收藏）。"""
+    """把论文复制成一份完全独立的副本（结构/导读/卡片/笔记/标亮/画像/收藏/原位译文）。"""
     src = get_paper(pid)
     if not src:
         return None
@@ -416,6 +450,10 @@ def copy_paper(pid, folder_id, new_pid: str, new_pdf_path: str) -> str | None:
                       " VALUES(?,?,?,?,?,?,?)",
                       (uuid.uuid4().hex[:12], new_pid, r["page"], r["color"], r["text"],
                        r["rects"], r["created_at"]))
+        # 副本结构一致：原位译文按 block_id 一并继承，避免重复调用模型
+        c.execute("INSERT INTO translation(paper_id,block_id,translation,created_at,updated_at)"
+                  " SELECT ?,block_id,translation,created_at,updated_at"
+                  " FROM translation WHERE paper_id=?", (new_pid, pid))
     return new_pid
 
 
@@ -559,6 +597,7 @@ def clear_all_data(keep_llm_settings: bool = True) -> int:
         c.execute("DELETE FROM card")
         c.execute("DELETE FROM highlight")
         c.execute("DELETE FROM paper_meta")
+        c.execute("DELETE FROM translation")
         c.execute("DELETE FROM profile")
         c.execute("DELETE FROM paper")
         c.execute("DELETE FROM folder")

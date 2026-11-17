@@ -3,6 +3,8 @@ export interface Block {
   y0: number; y1: number; x0: number; x1: number; size: number; text: string; section_id: string | null
   /** 落在表格框内的正文块（摘要会排除；卡片锚点仍有效） */
   table_id?: string
+  /** 页脚/脚注小字，原位翻译跳过 */
+  footer?: boolean
 }
 export interface Section {
   id: string; title: string; level: number; page: number; heading_block_id: string
@@ -223,6 +225,11 @@ export const api = {
     fetch(`/api/papers/${pid}/tables`).then(j),
   translate: (pid: string, block_id: string): Promise<{ translation: string; page: number; text?: string }> =>
     fetch(`/api/papers/${pid}/translate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id }) }).then(j),
+  inlineTranslations: (pid: string): Promise<{ translations: Record<string, string> }> =>
+    fetch(`/api/papers/${pid}/translations`).then(j),
+  translateInline: (pid: string, block_id: string, force = false, signal?: AbortSignal):
+    Promise<{ translation: string; block_id: string; page: number; text: string; cached: boolean }> =>
+    fetch(`/api/papers/${pid}/translate-inline`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id, force }), signal }).then(j),
   translateSelection: (pid: string, body: { text: string; block_id?: string }):
     Promise<{ translation: string; block_id: string; page: number }> =>
     fetch(`/api/papers/${pid}/translate-selection`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),

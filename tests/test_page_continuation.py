@@ -45,6 +45,30 @@ def test_caption_vs_sentence_starting_with_table():
         "Table 1 includes descriptive information and correlations for all measured variables. All scores were")
 
 
+def test_weighted_body_size_ignores_short_small_text():
+    assert pdf_parse._weighted_median_size([(8.0, 20), (10.0, 500), (7.0, 10)]) == 10.0
+
+
+def test_split_footer_lines_from_last_paragraph():
+    def line(text, size, y):
+        return {"text": text, "size": size, "bbox": (0, y, 300, y + 10),
+                "bold": False, "italic": False, "spans": []}
+
+    lines = [
+        line("The paragraph continues onto the next page and", 10.0, 700),
+        line("ends with a dangling preposition of", 10.0, 711),
+        line("This work is supported by a foundation.", 8.0, 750),
+        line("Grant No. 123456.", 8.0, 760),
+    ]
+    segs = pdf_parse._split_block_to_items(lines, 10.0, False, 800.0)
+    assert len(segs) == 2
+    assert segs[0][0] == "para"
+    assert segs[1][0] == "footer"
+    assert "dangling preposition of" in pdf_parse._join_lines(segs[0][1])
+    assert "Grant No. 123456." in pdf_parse._join_lines(segs[1][1])
+    assert len(segs[1][1]) == 2
+
+
 def test_link_page_continuation_mid_sentence_skips_footnote():
     blocks = [
         _block("b1", 1, "This paragraph starts here and continues into the"),
@@ -57,6 +81,17 @@ def test_link_page_continuation_mid_sentence_skips_footnote():
     assert "cont_of" not in blocks[0]
     assert logical_blocks(st)[0]["text"] == "This paragraph starts here and continues into the next page without any break."
     assert page_label(logical_blocks(st)[0]) == "第1–2页"
+
+
+def test_link_page_continuation_ignores_trailing_footer_text():
+    blocks = [
+        _block("b1", 1, "The static model uses the extension deflections of "
+                        "This work is supported by a foundation."),
+        _block("b2", 2, "cables that are neglected in the model."),
+    ]
+    st = _structure(blocks)
+    pdf_parse.ensure_block_links(st)
+    assert blocks[1]["cont_of"] == "b1"
 
 
 def test_link_page_continuation_skips_table_caption():

@@ -396,6 +396,64 @@ def translate(structure: dict, block_id: str) -> dict:
             "block_id": block_id, "page": b["page"], "text": text}
 
 
+def inline_block(structure: dict, block_id: str) -> dict:
+    """原位翻译的目标物理块：只允许非空段落/标题，排除表格与参考文献章节。"""
+    blocks = {b["id"]: b for b in structure.get("blocks") or []}
+    b = blocks.get(block_id)
+    if not b:
+        raise ValueError("找不到该块")
+    text = (b.get("text") or "").strip()
+    if b.get("type") not in ("para", "heading") or b.get("table_id") or not text:
+        raise ValueError("该块没有可翻译的正文（仅段落/标题可原位翻译）")
+    lb = paragraph_index(structure).get(block_id) or b
+    ref_sections = {s["id"] for s in structure.get("sections") or []
+                    if s.get("is_references")}
+    if b.get("section_id") in ref_sections or lb.get("section_id") in ref_sections:
+        raise ValueError("参考文献章节不提供原位翻译")
+    sec_title = next((s.get("title") or "" for s in structure.get("sections") or []
+                      if s.get("id") == (b.get("section_id") or lb.get("section_id"))), "")
+    return {"block_id": block_id, "page": b.get("page") or lb.get("page") or 0,
+            "text": text, "paragraph": (lb.get("text") or text).strip(),
+            "section": sec_title}
+
+
+def translate_inline(structure: dict, block_id: str) -> dict:
+    """原位翻译：只翻译当前物理块；跨页段落仅把完整逻辑段落作为上下文。"""
+    src = inline_block(structure, block_id)
+    text = src["text"]
+    para = src["paragraph"]
+    origin = "；".join(x for x in (
+        f"论文标题：{structure.get('title', '')}" if structure.get("title") else "",
+        f"所在章节：{src['section']}" if src["section"] else "") if x)
+    ctx = ""
+    if para and para != text:
+        ctx = ("完整段落（该段可能跨页被拆成多个物理块，仅作上下文，"
+               "**不要翻译这一段**）：\n"
+               + para[:3000] + "\n\n")
+    prompt = f"""把下面学术论文中的一个物理块翻译成简体中文。
+{origin + chr(10) if origin else ''}要求：
+- 只翻译「当前物理块」；它可能只是完整段落的一部分，**不得翻译、补写或合并上下文中属于其他物理块的内容**，译文只对应当前物理块的原文。
+- 忠实、通顺，专业术语首次出现时保留英文并在括号中给中文；公式符号（如 $R$, q_12）原样保留。
+- 若片段以公式符号为主、无法有效翻译，返回 {{"error": "该片段以公式符号为主，无法有效翻译"}}。
+只输出 JSON：{{"translation": "..."}}
+
+{ctx}当前物理块：
+{text}"""
+    data = llm.chat_json(prompt, "你是学术翻译。", purpose="translate",
+                         fallback_key="result")
+    data = data if isinstance(data, dict) else {}
+    raw = data.get("translation")
+    translation = raw.strip() if isinstance(raw, str) else ""
+    if not translation:
+        # 模型返回 error / 空对象 / 纯文本退化（{"result": ...}）/ 空白译文都算失败，
+        # 不能把错误文案或占位串当译文缓存下来。
+        raw_err = data.get("error")
+        err = raw_err.strip() if isinstance(raw_err, str) else ""
+        raise ValueError(err or "模型未返回有效译文，请重试")
+    return {"translation": translation,
+            "block_id": block_id, "page": src["page"], "text": text}
+
+
 def chat(structure: dict, block_ids: list[str], history: list[dict], question: str,
          allow_search: bool = True, familiarity: str | None = None,
          analysis: dict | None = None, table_id: str = "") -> dict:

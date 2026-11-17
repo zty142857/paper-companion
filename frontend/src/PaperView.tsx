@@ -50,6 +50,20 @@ export default function PaperView({ id }: { id: string }) {
   const [termTops, setTermTops] = useState<Record<string, number>>({})
   const [activeId, setActiveId] = useState<string | null>(null)
   const [tool, setTool] = useState<{ x: number; y: number; blockId: string } | null>(null)
+  const [translationMode, setTranslationMode] = useState(false)
+  const [inlineTranslations, setInlineTranslations] = useState<Record<string, string>>({})
+  const [translationPending, setTranslationPending] = useState<Record<string, boolean>>({})
+  const [translationErrors, setTranslationErrors] = useState<Record<string, string>>({})
+  const [showOriginal, setShowOriginal] = useState<Record<string, boolean>>({})
+  const [batchTranslation, setBatchTranslation] = useState<{
+    sectionId: string; title: string; total: number; done: number; failed: number; running: boolean
+    stopped?: boolean
+  } | null>(null)
+  const [sectionMenu, setSectionMenu] = useState<{ sectionId: string; x: number; y: number } | null>(null)
+  const translationSeq = useRef(0)
+  const batchSeq = useRef(0)
+  const batchStop = useRef(false)
+  const translationAbort = useRef<AbortController | null>(null)
   const [profile, setProfile] = useState(false)
   const [plan, setPlan] = useState<ReadingPlan | null>(null)
   const [showPlan, setShowPlan] = useState(false)
@@ -163,6 +177,11 @@ export default function PaperView({ id }: { id: string }) {
     setTableBusy(false); setTableCopied(false)
     setFormulaBusy(false); setFormulaStep(''); setFormulaErr(''); setFormulaResult(null); setFormulaCopied('')
     setFindOpen(false); setFindHits(null); setFindQ('')
+    translationAbort.current?.abort(); translationAbort.current = null
+    translationSeq.current += 1; batchSeq.current += 1; batchStop.current = true
+    setTranslationMode(false); setInlineTranslations({}); setTranslationPending({})
+    setTranslationErrors({}); setShowOriginal({}); setBatchTranslation(null)
+    setSectionMenu(null)
     api.get(id).then((p) => {
       if (paperIdRef.current !== id) return
       setPaper(p)
@@ -179,6 +198,11 @@ export default function PaperView({ id }: { id: string }) {
     api.cards(id).then((cs) => {
       if (paperIdRef.current === id) setCards(cs)
     }).catch(() => {})
+    api.inlineTranslations(id).then((d) => {
+      if (paperIdRef.current === id) {
+        setInlineTranslations((local) => ({ ...(d.translations || {}), ...local }))
+      }
+    }).catch(() => {})
     api.highlights(id).then((hs) => {
       if (paperIdRef.current === id) setHighlights(hs)
     }).catch(() => {})
@@ -191,6 +215,15 @@ export default function PaperView({ id }: { id: string }) {
       if (!d.meta?.domain) setProfile(true)   // 未做过摸底 → 上传后立即弹问卷
     }).catch(() => {})
   }, [id, loadTables])
+
+  // 离开论文时停止章节队列并中止在途请求，避免后台继续产生模型调用。
+  useEffect(() => () => {
+    batchStop.current = true
+    batchSeq.current += 1
+    translationSeq.current += 1
+    translationAbort.current?.abort()
+    translationAbort.current = null
+  }, [])
 
   // tableView 换图/关闭时释放上一张图的 object URL
   useEffect(() => () => { if (tableView) URL.revokeObjectURL(tableView.url) }, [tableView])
@@ -218,6 +251,24 @@ export default function PaperView({ id }: { id: string }) {
     addEventListener('mousedown', down)
     return () => removeEventListener('mousedown', down)
   }, [selected, hlMenu, formulaResult, tableTool, tableView, selTrans])
+
+  // 章节右键菜单：点外部、滚轮或 Esc 关闭
+  useEffect(() => {
+    if (!sectionMenu) return
+    const down = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest('.section-menu')) setSectionMenu(null)
+    }
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setSectionMenu(null) }
+    const wheel = () => setSectionMenu(null)
+    addEventListener('mousedown', down)
+    addEventListener('keydown', esc)
+    addEventListener('wheel', wheel, { passive: true })
+    return () => {
+      removeEventListener('mousedown', down)
+      removeEventListener('keydown', esc)
+      removeEventListener('wheel', wheel)
+    }
+  }, [sectionMenu])
 
   useEffect(() => {
     if (!tableTool && !tableView) return
@@ -317,6 +368,45 @@ export default function PaperView({ id }: { id: string }) {
   const blocks = useMemo(() => paper?.structure.blocks ?? [], [paper?.structure.blocks])
   const blockMap: Record<string, Block> = useMemo(
     () => Object.fromEntries(blocks.map((b) => [b.id, b])), [blocks])
+  const referenceSections = useMemo(() => new Set(
+    (paper?.structure.sections ?? []).filter((s) => s.is_references).map((s) => s.id),
+  ), [paper?.structure.sections])
+  const translatable = useCallback((b: Block) => (
+    (b.type === 'para' || b.type === 'heading') && !!b.text?.trim()
+    && !b.table_id && !b.footer && !referenceSections.has(b.section_id || '')
+  ), [referenceSections])
+  const sectionBlocks = useCallback((sectionId: string) => {
+    const sections = paper?.structure.sections ?? []
+    const start = sections.findIndex((s) => s.id === sectionId)
+    if (start < 0) return []
+    const section = sections[start]
+    const depth = secDepth(section.title)
+    const opening = section.title === '(正文开头)'
+    let end = sections.length
+    if (opening) {
+      // 开篇只到第一个正式标题，避免把整篇正文都算成开篇。
+      for (let i = start + 1; i < sections.length; i++) {
+        if (sections[i].is_references || sections[i].heading_block_id) { end = i; break }
+      }
+    } else if (depth > 0) {
+      // 有编号的章/节包含其下级；无编号小标题视为子标题，不提前截断本章。
+      for (let i = start + 1; i < sections.length; i++) {
+        if (sections[i].is_references) { end = i; break }
+        const d = secDepth(sections[i].title)
+        if (d > 0 && d <= depth) { end = i; break }
+      }
+    } else {
+      // 无编号标题无法可靠推断层级：只翻译自身小节，避免误吞后续整章。
+      end = start + 1
+    }
+    const ids = new Set(sections.slice(start, end).filter((s) => !s.is_references).map((s) => s.id))
+    return blocks.filter((b) => ids.has(b.section_id || '') && translatable(b))
+  }, [paper?.structure.sections, blocks, translatable])
+  const visibleTranslations = useMemo(() => translationMode
+    ? Object.fromEntries(Object.entries(inlineTranslations).filter(([bid]) =>
+      translatable(blockMap[bid]) && !showOriginal[bid]))
+    : {}, [translationMode, inlineTranslations, showOriginal, translatable, blockMap])
+  const translationBusy = !!batchTranslation?.running || Object.keys(translationPending).length > 0
 
   // 公式区域，供框选吸附。新解析结果直接用后端版面模型给出的整条公式框（已裁掉编号）；
   // 老论文（没有 formulas 字段）沿用 formula 块 + PUA 片段聚类。
@@ -403,7 +493,8 @@ export default function PaperView({ id }: { id: string }) {
     return card.top
   }, [blockMap])
   const recompute = useCallback(() => {
-    setTops(Object.fromEntries(cards.map((c) => [c.id, anchorTop(c)])))
+    const visibleCards = cards.filter((c) => c.type !== 'translation' || c.data.selection)
+    setTops(Object.fromEntries(visibleCards.map((c) => [c.id, anchorTop(c)])))
     // 术语小卡锚定到其首个出现块
     const r = rightRail.current || leftRail.current
     if (viewer.current && r) {
@@ -486,21 +577,109 @@ export default function PaperView({ id }: { id: string }) {
     return c
   }
 
-  const doTranslate = async (blockId: string) => {
+  const doTranslate = async (blockId: string, force = false) => {
+    const b = blockMap[blockId]
+    if (!b || !translatable(b) || translationPending[blockId]
+      || batchTranslation?.running || Object.keys(translationPending).length) return
     setTool(null)
-    const orig = blockMap[blockId]?.text.slice(0, 160)
-    const c = await addCard('translation', blockId, { orig, pending: true })
+    const reqId = id
+    const seq = translationSeq.current
+    const ac = new AbortController()
+    translationAbort.current?.abort()
+    translationAbort.current = ac
+    setTranslationErrors((e) => { const n = { ...e }; delete n[blockId]; return n })
+    setTranslationPending((p) => ({ ...p, [blockId]: true }))
     try {
-      const r = await api.translate(id, blockId)
-      const data = { ...c.data, orig: (r.text || c.data.orig || '').slice(0, 160),
-        translation: r.translation, page: r.page, pending: false }
-      setCards((cs) => cs.map((x) => x.id === c.id ? { ...x, data } : x))
-      api.patchCard(c.id, { data })
+      const r = await api.translateInline(reqId, blockId, force, ac.signal)
+      if (paperIdRef.current !== reqId || translationSeq.current !== seq) return
+      setInlineTranslations((t) => ({ ...t, [blockId]: r.translation }))
+      setShowOriginal((o) => { const n = { ...o }; delete n[blockId]; return n })
+      setTranslationMode(true)
     } catch (e: any) {
-      const data = { ...c.data, pending: false, error: String(e?.message || e) }
-      setCards((cs) => cs.map((x) => x.id === c.id ? { ...x, data } : x))
-      api.patchCard(c.id, { data })
+      if (ac.signal.aborted) return
+      if (paperIdRef.current === reqId && translationSeq.current === seq) {
+        setTranslationErrors((x) => ({ ...x, [blockId]: String(e?.message || e) }))
+      }
+    } finally {
+      if (translationAbort.current === ac) translationAbort.current = null
+      if (paperIdRef.current === reqId && translationSeq.current === seq) {
+        setTranslationPending((p) => { const n = { ...p }; delete n[blockId]; return n })
+      }
     }
+  }
+
+  const toggleOriginal = (blockId: string) => {
+    const showingTranslation = translationMode && !showOriginal[blockId]
+    if (showingTranslation) {
+      setShowOriginal((o) => ({ ...o, [blockId]: true }))
+    } else {
+      setTranslationMode(true)
+      setShowOriginal((o) => { const n = { ...o }; delete n[blockId]; return n })
+    }
+    setTool(null)
+    window.getSelection()?.removeAllRanges()
+  }
+
+  const translateSection = async (sectionId: string, force = false) => {
+    if (batchTranslation?.running || Object.keys(translationPending).length) return
+    const section = paper?.structure.sections.find((s) => s.id === sectionId)
+    const todo = sectionBlocks(sectionId).filter((b) => force || !inlineTranslations[b.id])
+    if (!todo.length) {
+      setTranslationMode(true)
+      setBatchTranslation({ sectionId, title: section?.title || '本章', total: 0, done: 0, failed: 0, running: false })
+      return
+    }
+    const reqId = id
+    const seq = translationSeq.current
+    const batch = ++batchSeq.current
+    const ac = new AbortController()
+    translationAbort.current?.abort()
+    translationAbort.current = ac
+    batchStop.current = false
+    setTranslationMode(true)
+    setShowOriginal({})
+    setBatchTranslation({ sectionId, title: section?.title || '本章', total: todo.length, done: 0, failed: 0, running: true })
+    for (const b of todo) {
+      if (batchStop.current || batchSeq.current !== batch
+        || paperIdRef.current !== reqId || translationSeq.current !== seq) break
+      setTranslationErrors((x) => { const n = { ...x }; delete n[b.id]; return n })
+      setTranslationPending((p) => ({ ...p, [b.id]: true }))
+      try {
+        const r = await api.translateInline(reqId, b.id, force, ac.signal)
+        if (paperIdRef.current !== reqId || translationSeq.current !== seq) break
+        setInlineTranslations((t) => ({ ...t, [b.id]: r.translation }))
+      } catch (e: any) {
+        if (ac.signal.aborted) break
+        if (paperIdRef.current !== reqId || translationSeq.current !== seq) break
+        setTranslationErrors((x) => ({ ...x, [b.id]: String(e?.message || e) }))
+        setBatchTranslation((s) => s?.sectionId === sectionId ? { ...s, failed: s.failed + 1 } : s)
+      } finally {
+        if (paperIdRef.current === reqId && translationSeq.current === seq) {
+          setTranslationPending((p) => { const n = { ...p }; delete n[b.id]; return n })
+          setBatchTranslation((s) => s?.sectionId === sectionId ? { ...s, done: s.done + 1 } : s)
+        }
+      }
+    }
+    if (translationAbort.current === ac) translationAbort.current = null
+    if (paperIdRef.current === reqId && translationSeq.current === seq) {
+      setBatchTranslation((s) => s?.sectionId === sectionId ? { ...s, running: false } : s)
+    }
+  }
+
+  const retranslateSection = (sectionId: string) => {
+    const n = sectionBlocks(sectionId).length
+    if (!n || !window.confirm(`将重新翻译本章共 ${n} 段，会覆盖现有译文并产生 ${n} 次模型调用。继续？`)) return
+    void translateSection(sectionId, true)
+  }
+
+  const stopSectionTranslation = () => {
+    batchStop.current = true
+    batchSeq.current += 1
+    translationSeq.current += 1
+    translationAbort.current?.abort()
+    translationAbort.current = null
+    setTranslationPending({})
+    setBatchTranslation((s) => s ? { ...s, running: false, stopped: true } : s)
   }
 
   const askChat = async (card: Card, question: string) => {
@@ -838,6 +1017,7 @@ export default function PaperView({ id }: { id: string }) {
   const goFind = (h: { page: number }) => {
     const reqId = id
     setFindOpen(false)
+    setTranslationMode(false); setShowOriginal({})
     viewer.current?.scrollToPage(h.page)
     const q = findQ.trim().split(/\s+/)[0]
     window.setTimeout(() => {
@@ -901,10 +1081,11 @@ export default function PaperView({ id }: { id: string }) {
   // 窄屏只保留右轨：所有卡片和术语统一进右轨，论文拿走左轨让出的宽度
   const leftTerms = singleRail ? [] : visibleTerms.filter((t) => termSide(t) === 'left')
   const rightTerms = singleRail ? visibleTerms : visibleTerms.filter((t) => termSide(t) !== 'left')
-  const leftCards = singleRail ? [] : cards.filter((c) => c.type !== 'term' && sideOf(c.block_id) === 'left')
+  const leftCards = singleRail ? [] : cards.filter((c) => c.type !== 'term'
+    && (c.type !== 'translation' || c.data.selection) && sideOf(c.block_id) === 'left')
   const rightCards = singleRail
-    ? cards.filter((c) => c.type !== 'term')
-    : cards.filter((c) => c.type !== 'term' && sideOf(c.block_id) !== 'left')
+    ? cards.filter((c) => c.type !== 'term' && (c.type !== 'translation' || c.data.selection))
+    : cards.filter((c) => c.type !== 'term' && (c.type !== 'translation' || c.data.selection) && sideOf(c.block_id) !== 'left')
 
   const renderTerm = (t: (typeof visibleTerms)[number]) => (
     <TermItem key={t.term} term={t.term} zh={t.zh}
@@ -944,6 +1125,12 @@ export default function PaperView({ id }: { id: string }) {
             表格识别失败 <button type="button" className="table-retry" onClick={loadTables}>重试</button>
           </span>
         )}
+        <button className={`btn small${translationMode ? ' primary' : ''}`}
+          onClick={() => {
+            setTranslationMode((v) => !v); setShowOriginal({}); setSelected(null)
+            window.getSelection()?.removeAllRanges()
+          }} title="切换已翻译段落的原文/译文；未翻译段落始终显示原文">
+          {translationMode ? '译文' : '原文'}</button>
         <button className={`btn small${showSections ? ' primary' : ''}`} onClick={toggleSections}
           title={showSections ? '收起章节概要侧边栏' : '展开章节概要侧边栏'}>☰ 章节</button>
         <button className="btn small" onClick={() => setFindOpen(true)} title="在当前论文全文中检索">🔍 全文检索</button>
@@ -1039,11 +1226,17 @@ export default function PaperView({ id }: { id: string }) {
             {structure.sections.filter((s) => !s.is_references).map((s) => {
               const d = secDepth(s.title)      // 1=篇 2=章 3=节，无编号=0
               return (
-                <div key={s.id} className={`sec d${d}`} onClick={() => jump(s.page)} title={`第 ${s.page} 页`}
+                <div key={s.id} className={`sec d${d}`}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    setSectionMenu({ sectionId: s.id, x: e.clientX, y: e.clientY })
+                  }}
                   style={d > 0 ? { paddingLeft: 10 + (d - 1) * 14 } : undefined}>
-                  <div className={d <= 1 ? 'lv1' : 'lv2'}>{s.title}</div>
-                  {typeof outlineMap[s.id] === 'string' && outlineMap[s.id]
-                    && <div className="o">{outlineMap[s.id]}</div>}
+                  <div onClick={() => jump(s.page)} title={`第 ${s.page} 页 · 右键批量翻译`}>
+                    <div className={d <= 1 ? 'lv1' : 'lv2'}>{s.title === '(正文开头)' ? '开篇' : s.title}</div>
+                    {typeof outlineMap[s.id] === 'string' && outlineMap[s.id]
+                      && <div className="o">{outlineMap[s.id]}</div>}
+                  </div>
                 </div>
               )
             })}
@@ -1057,6 +1250,8 @@ export default function PaperView({ id }: { id: string }) {
             </aside>
           )}
           <PdfViewer url={`/api/papers/${id}/pdf`} blocks={blocks} onReady={onReady}
+            translationMode={translationMode && Object.keys(visibleTranslations).length > 0}
+            inlineTranslations={visibleTranslations}
             onLayout={recompute}
             onBlockClick={(blockId, x, y) => setTool({ blockId, x, y })}
             highlights={highlights}
@@ -1075,9 +1270,54 @@ export default function PaperView({ id }: { id: string }) {
           </aside>
         </div>
       </div>
+      {sectionMenu && (() => {
+        const s = paper.structure.sections.find((x) => x.id === sectionMenu.sectionId)
+        if (!s) return null
+        const all = sectionBlocks(s.id)
+        const missing = all.filter((b) => !inlineTranslations[b.id]).length
+        const translated = all.length - missing
+        return (
+          <div className="section-menu" style={{
+            left: Math.max(8, Math.min(sectionMenu.x, innerWidth - 246)),
+            top: Math.max(8, Math.min(sectionMenu.y, innerHeight - 150)),
+          }} onContextMenu={(e) => e.preventDefault()}>
+            <div className="sm-title">{s.title === '(正文开头)' ? '开篇' : s.title}</div>
+            <button disabled={translationBusy || missing === 0}
+              onClick={() => { setSectionMenu(null); void translateSection(s.id) }}>
+              {missing ? `翻译本章（${missing} 段待译）` : '本章已全部翻译'}
+            </button>
+            {translated > 0 && (
+              <button disabled={translationBusy}
+                onClick={() => { setSectionMenu(null); retranslateSection(s.id) }}>
+                重新翻译本章（{all.length} 段）
+              </button>
+            )}
+            <div className="sm-hint">章节导航右键打开</div>
+          </div>
+        )
+      })()}
+      {batchTranslation && (
+        <div className="translation-progress">
+          <span>“{batchTranslation.title}” {batchTranslation.total
+            ? `${batchTranslation.done}/${batchTranslation.total} 段`
+            : '已全部翻译'}{batchTranslation.failed ? ` · ${batchTranslation.failed} 段失败` : ''}
+            {batchTranslation.stopped ? ' · 已停止' : ''}</span>
+          {batchTranslation.running
+            ? <button className="btn small" onClick={stopSectionTranslation}>停止</button>
+            : <button className="x" title="关闭进度" onClick={() => setBatchTranslation(null)}>✕</button>}
+        </div>
+      )}
       {tool && (
         <div className="toolbar-pop" style={{ left: Math.min(tool.x + 8, innerWidth - 300), top: Math.min(tool.y + 8, innerHeight - 60) }}>
-          <button onClick={() => doTranslate(tool.blockId)}>🈶 翻译此段</button>
+          <button onClick={() => doTranslate(tool.blockId, !!inlineTranslations[tool.blockId])} disabled={translationBusy || !translatable(blockMap[tool.blockId])}>
+            {translationPending[tool.blockId] ? '翻译中…' : translationErrors[tool.blockId]
+              ? '重试翻译' : inlineTranslations[tool.blockId] ? '重新翻译此段' : '🈶 翻译此段'}</button>
+          {inlineTranslations[tool.blockId]
+            && <button onClick={() => toggleOriginal(tool.blockId)}>
+              {translationMode && !showOriginal[tool.blockId] ? '查看原文' : '查看译文'}</button>}
+          {translationErrors[tool.blockId]
+            && <div className="inline-tool-error" title={translationErrors[tool.blockId]}>翻译失败，可点此段重试</div>}
+          {translationPending[tool.blockId] && <div className="inline-tool-progress">正在生成译文…</div>}
           <button onClick={() => addChat(tool.blockId)}>💬 就此段提问</button>
           <button onClick={() => addChatGlobal(tool.blockId)} title="卡片仍锚在这段旁，但回答基于全文导读与目录，不局限于本段">🌐 问全文</button>
           <button onClick={() => addChat(tool.blockId, '用通俗的话讲讲这段在说什么')}> 通俗讲解</button>

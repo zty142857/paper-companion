@@ -570,6 +570,39 @@ def translate(pid: str, body: TranslateIn):
         raise HTTPException(422, str(e))
 
 
+class TranslateInlineIn(BaseModel):
+    block_id: str
+    force: bool = False
+
+
+@app.get("/api/papers/{pid}/translations")
+def translations(pid: str):
+    """该论文已缓存的原位译文（block_id → 译文）。"""
+    if not db.get_paper(pid):
+        raise HTTPException(404, "not found")
+    return {"translations": db.get_translations(pid)}
+
+
+@app.post("/api/papers/{pid}/translate-inline")
+def translate_inline(pid: str, body: TranslateInlineIn):
+    """原位翻译单个物理块：默认命中缓存直接返回，force=true 强制重译并覆盖。"""
+    p = db.get_paper(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    try:
+        src = ai.inline_block(p["structure"], body.block_id)
+        if not body.force:
+            cached = db.get_translation(pid, body.block_id)
+            if cached is not None:
+                return {"translation": cached, "block_id": src["block_id"],
+                        "page": src["page"], "text": src["text"], "cached": True}
+        r = ai.translate_inline(p["structure"], body.block_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    db.save_translation(pid, body.block_id, r["translation"])
+    return {**r, "cached": False}
+
+
 class SelectionTranslateIn(BaseModel):
     text: str
     block_id: str = ""

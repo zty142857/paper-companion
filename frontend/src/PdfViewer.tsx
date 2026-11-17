@@ -1,7 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
 import * as pdfjs from 'pdfjs-dist'
 import workerUrl from './pdf.worker?worker&url'
 import type { Highlight, TableBox } from './api'
+import InlineTranslation, { MIN_TRANSLATION_FONT } from './InlineTranslation'
+import type { InlineTranslationBlock } from './InlineTranslation'
 
 // workerSrc 指向自建 worker 入口（见 pdf.worker.ts）：它会在启动 pdf.js worker 前补上
 // Map.prototype.getOrInsertComputed 等新内置方法，否则旧内核浏览器整篇 PDF 渲染失败。
@@ -20,6 +23,8 @@ export const HL_COLOR_NAMES: Record<string, string> = {
 
 export interface HitBlock {
   id: string; page: number; y0: number; y1: number; x0: number; x1: number; type: string
+  /** 原文块字号（pt）；原位译文用它换算近似字号 */
+  size?: number; text?: string; table_id?: string; col?: number
 }
 export interface SelectedText {
   page: number; text: string; rects: number[][]
@@ -99,6 +104,10 @@ interface Props {
   onHighlightClick?: (h: Highlight, x: number, y: number) => void
   tables?: TableBox[]
   onTableClick?: (table: TableBox, x: number, y: number) => void
+  /** 全局译文模式：隐藏原文标亮，停用原文 textLayer 的划词/检索高亮 */
+  translationMode?: boolean
+  /** 父组件算好的「当前实际可见」块译文（block id -> 译文），不含临时查看原文的块 */
+  inlineTranslations?: Record<string, string>
 }
 
 function hitIn(pages: Map<number, { el: HTMLDivElement; scale: number }>, blocks: HitBlock[], x: number, y: number) {
@@ -202,7 +211,7 @@ function renderPage(page: any, opts: any, slowMs: number, onSlow: () => void): P
 
 export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout,
   highlights = [], onSelectText, onFormulaCrop, formulaRegions = [], onHighlightClick,
-  tables = [], onTableClick }: Props) {
+  tables = [], onTableClick, translationMode = false, inlineTranslations = {} }: Props) {
   const box = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(DEFAULT_SCALE)
   const [displayScale, setDisplayScale] = useState(scale)
@@ -231,6 +240,97 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     x0: number; y0: number; pointerId: number
   } | null>(null)
 
+  // 原位译文：父组件的状态通过 ref 读，页面是命令式异步构建的，回调里不能依赖闭包快照。
+  const translationModeRef = useRef(translationMode)
+  translationModeRef.current = translationMode
+  const inlineTranslationsRef = useRef(inlineTranslations)
+  inlineTranslationsRef.current = inlineTranslations
+  const blocksRef = useRef(blocks)
+  blocksRef.current = blocks
+  // 每页一个独立的 React 根，挂在该页的 .il-layer 上；页面随缩放重建时统一卸载重挂。
+  const ilRoots = useRef(new Map<number, { root: Root; host: HTMLDivElement; sig: string }>())
+
+  const unmountTranslations = useCallback(() => {
+    const entries = [...ilRoots.current.values()]
+    ilRoots.current.clear()
+    // 不能在 React 的 render/effect 阶段同步卸载另一个 root；延后到本次提交结束。
+    queueMicrotask(() => {
+      for (const { root, host } of entries) {
+        root.unmount()
+        host.remove()
+      }
+    })
+  }, [])
+
+  /** 把当前可见译文按 block bbox*scale 绝对定位到各自页面上；无译文的块保持原 PDF。 */
+  const syncTranslations = useCallback(() => {
+    const show = translationModeRef.current
+    const tr = inlineTranslationsRef.current
+    const list = blocksRef.current
+    // 正文译文统一用全书正文主字号，避免解析器给出的块字号略有差异时一段大一段小。
+    const bodySizes = list
+      .filter((b) => b.type === 'para' && !b.table_id && (b.text || '').trim().length >= 20 && (b.size || 0) > 0)
+      .map((b) => b.size as number)
+      .sort((a, b) => a - b)
+    const bodyBase = bodySizes.length ? bodySizes[Math.floor(bodySizes.length / 2)] : 10.5
+    for (const [pno, pe] of pageEls.current) {
+      const items: InlineTranslationBlock[] = []
+      if (show) {
+        for (const b of list) {
+          if (b.page !== pno || b.type === 'figure') continue
+          const text = tr[b.id]
+          if (typeof text !== 'string' || !text.trim()) continue
+          const width = (b.x1 - b.x0) * pe.scale
+          const height = (b.y1 - b.y0) * pe.scale
+          if (width < 10 || height < 8) continue
+          const base = b.type === 'heading' && b.size && b.size > 0 ? b.size : bodyBase
+          const pageBottom = pe.el.clientHeight / pe.scale - 4
+          let nextY = pageBottom
+          for (const other of list) {
+            if (other.id === b.id || other.page !== pno || other.col !== b.col) continue
+            if (other.y0 >= b.y1 - 0.5 && other.y0 < nextY) nextY = other.y0
+          }
+          const gap = Math.max(0, nextY - b.y1)
+          const extra = Math.min(bodyBase * 2.6, Math.max(0, gap - 1))
+          items.push({
+            id: b.id,
+            text: text.trim(),
+            left: b.x0 * pe.scale,
+            top: b.y0 * pe.scale,
+            width,
+            height,
+            maxHeight: (b.y1 - b.y0 + extra) * pe.scale,
+            fontSize: Math.max(MIN_TRANSLATION_FONT, Math.min(34, base * pe.scale)),
+            heading: b.type === 'heading',
+          })
+        }
+      }
+      const entry = ilRoots.current.get(pno)
+      if (!items.length) {
+        // 没有译文的页不保留空覆盖层，避免无谓的点击/布局干扰
+        if (entry) {
+          ilRoots.current.delete(pno)
+          entry.host.remove()
+          queueMicrotask(() => entry.root.unmount())
+        }
+        continue
+      }
+      const sig = JSON.stringify(items)
+      if (entry?.sig === sig) continue
+      if (!entry) {
+        const host = document.createElement('div')
+        host.className = 'il-layer'
+        pe.el.appendChild(host)
+        const root = createRoot(host)
+        ilRoots.current.set(pno, { root, host, sig })
+        root.render(<InlineTranslation items={items} />)
+      } else {
+        entry.sig = sig
+        entry.root.render(<InlineTranslation items={items} />)
+      }
+    }
+  }, [])
+
   /** 把持久化标亮画到每一页（rects 是相对页面内容区的 0~1 比例，缩放后自动还原） */
   const drawHighlights = () => {
     for (const [pno, pe] of pageEls.current) {
@@ -241,6 +341,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
         pe.el.appendChild(layer)
       }
       layer.innerHTML = ''
+      if (translationModeRef.current) continue
       for (const h of highlightsRef.current) {
         if (h.page !== pno) continue
         for (const r of mergeRects(h.rects || [])) {
@@ -286,6 +387,8 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
 
   /** 全文检索命中：在文本层里按关键词精确画临时高亮（不写入数据库） */
   const flashText = (page: number, query: string): boolean => {
+    // 译文模式下原文 textLayer 是隐藏的，检索高亮没有意义，直接安全地不执行
+    if (translationModeRef.current) return false
     const pe = pageEls.current.get(page)
     if (!pe || !query.trim()) return false
     const pageEl = pe.el
@@ -730,10 +833,12 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
           await tl.render()
           if (!dead) textLayers.current.push(tl)
         } catch { /* 文字层失败不影响图像展示 */ }
+        if (!dead) syncTranslations()
       }
       pdfjs.TextLayer.cleanup()
       if (!dead) drawHighlights()
       if (!dead) drawFormulaDebug()
+      if (!dead) syncTranslations()
       if (failed.length && !dead) {
         const shown = failed.slice(0, 6).join('、')
         setErr(`${failed.length}/${doc.numPages} 页渲染失败（第 ${shown}${failed.length > 6 ? ' 等' : ''} 页），其余页正常`)
@@ -742,6 +847,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     }).catch((e) => { if (!dead) setErr(String(e?.message || e)) })
     return () => {
       dead = true
+      unmountTranslations()
       docRef.current = null
       textLayers.current.forEach((t) => t.cancel())
       textLayers.current = []
@@ -749,7 +855,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       // v6 的 PDFDocumentProxy 没有公开 destroy()，必须销毁 loadingTask。
       if (task) void task.destroy().catch(() => {})
     }
-  }, [url, scale])
+  }, [url, scale, syncTranslations, unmountTranslations])
 
   // 重新渲染（缩放/换文档）时丢掉旧的拖拽框，避免引用已卸载的 page 元素
   useEffect(() => {
@@ -769,7 +875,10 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   }, [formulaMode])
 
   // 标亮数据变化（新增/换色/删除）或重新渲染后重画覆盖层
-  useEffect(() => { drawHighlights() }, [highlights, scale])
+  useEffect(() => { drawHighlights() }, [highlights, scale, translationMode])
+
+  // 译文数据/模式变化：同步每页的原位译文层（只渲染传入的可见块）
+  useEffect(() => { syncTranslations() }, [translationMode, inlineTranslations, blocks, syncTranslations])
 
   // 公式区域变化时重画调试框（`?debug=formula`，页面还没渲染时由渲染流程末尾补画）
   useEffect(() => { drawFormulaDebug() }, [formulaRegions, scale, url])
@@ -874,10 +983,19 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     }
   }
 
+  /** 选区是否落在原位译文层（译文自己可选/可复制，但不能走原文标亮/翻译流程） */
+  const inTranslationLayer = (node: Node | null): boolean => {
+    const el = node instanceof Element ? node : (node?.parentElement ?? null)
+    return !!el?.closest('.il-layer, .il-pop')
+  }
+
   const up = () => {
     if (formulaMode) return
+    // 译文模式停用原文 textLayer 的划词/标亮；译文层自己的选区直接忽略
+    if (translationModeRef.current) return
     const sel = window.getSelection()
     if (!sel || sel.isCollapsed) return
+    if (inTranslationLayer(sel.anchorNode) || inTranslationLayer(sel.focusNode)) return
     let node: Node | null = sel.getRangeAt(0).commonAncestorContainer
     let pageEl: HTMLElement | null = null
     while (node) {
@@ -960,7 +1078,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
   }
 
   return (
-    <div className={formulaMode ? 'viewer formula-mode' : 'viewer'}>
+    <div className={`viewer${formulaMode ? ' formula-mode' : ''}${translationMode ? ' translation-mode' : ''}`}>
       <div className="zoombar">
         <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 8 }}>缩放</span>
         <button className="btn small" onClick={() => manualSlide(clampScale(displayScale - 0.1))}>−</button>
