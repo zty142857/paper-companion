@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -656,6 +656,43 @@ def chat(pid: str, body: ChatIn):
     return ai.chat(p["structure"], body.block_ids, body.history, body.question,
                    familiarity=m.get("familiarity") if has_profile else None,
                    analysis=p.get("analysis"), table_id=body.table_id)
+
+
+def _sse_event(event: str, data: dict) -> str:
+    """SSE 线上格式：event 行 + 单行 JSON data + 空行。JSON 序列化保证 data 不会换行破帧。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/papers/{pid}/chat/stream")
+def chat_stream(pid: str, body: ChatIn):
+    """论文对话的 SSE 流式版：step 实时进展 / delta 原始增量 / done 最终结果（与 /chat 同构）。
+
+    请求体与 /chat 完全相同；done 的 answer 经过全部后处理，前端用它整体替换 delta 累积。
+    """
+    p = db.get_paper(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    db.mark_visited(pid)
+    m = db.get_meta(pid) or {}
+    has_profile = bool(m.get("domain")) and bool(m.get("plan"))
+
+    def gen():
+        # 流一旦开始（HTTP 200 已发出）就不能再改状态码，出错只能走 error 事件
+        try:
+            for ev in ai.chat_stream(p["structure"], body.block_ids, body.history, body.question,
+                                     familiarity=m.get("familiarity") if has_profile else None,
+                                     analysis=p.get("analysis"), table_id=body.table_id):
+                yield _sse_event(ev["event"], ev["data"])
+        except llm.LLMNotConfigured as e:
+            # code 与 HTTP 异常处理器（_llm_not_configured）保持一致，前端只需认一个值
+            yield _sse_event("error", {"detail": str(e), "code": "model_not_configured",
+                                       "purpose": e.purpose})
+        except Exception as e:
+            yield _sse_event("error", {"detail": f"对话生成失败：{llm.brief_error(e)}"})
+
+    # 同步生成器：FastAPI 会自动放线程池迭代，与其余同步路由保持一致
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---------------- 阶段三：档案 / 计划 / 检索 / 记忆 ----------------

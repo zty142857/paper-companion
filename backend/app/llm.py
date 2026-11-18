@@ -9,6 +9,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Iterator
 from urllib.parse import urlsplit
 
 import openai
@@ -259,6 +260,32 @@ def _is_transient(e: Exception) -> bool:
                                 "too many requests", "429", "500", "502", "503", "504"))
 
 
+def _degrade_params(e: Exception, kw: dict, cfg: dict) -> bool:
+    """参数降级阶梯：provider 不支持的可选参数 → 去掉并记住，返回是否降级（调用方立刻重试）。
+
+    老版 vLLM / Ollama 兼容层 / 部分中转不认 response_format，不降级会整站不可用。
+    降级不占瞬时错误重试额度。chat() 与 chat_stream() 共用，保证两条路行为一致。
+    """
+    low = str(e).lower()
+    if "response_format" in kw and ("response_format" in low or "json_object" in low):
+        kw.pop("response_format")
+        _mark_unsupported(cfg, "response_format")
+        return True
+    if "reasoning_effort" in kw and "reasoning_effort" in low:
+        kw.pop("reasoning_effort")
+        _mark_unsupported(cfg, "reasoning_effort")
+        return True
+    if "extra_body" in kw and ("enable_thinking" in low or "thinking_budget" in low):
+        kw.pop("extra_body")
+        _mark_unsupported(cfg, "extra_body")
+        return True
+    # OpenAI 推理模型要求 max_completion_tokens，旧参数会直接 400
+    if "max_tokens" in kw and "max_completion_tokens" in low:
+        kw["max_completion_tokens"] = kw.pop("max_tokens")
+        return True
+    return False
+
+
 def chat(messages: list[dict], *, purpose: str = "default", json_mode=False,
          max_tokens=4096) -> str:
     cfg = get_route(purpose)
@@ -278,26 +305,68 @@ def chat(messages: list[dict], *, purpose: str = "default", json_mode=False,
                 raise RuntimeError("服务商返回了空 choices（可能触发了内容过滤或额度限制）")
             return choices[0].message.content or ""
         except Exception as e:
-            low = str(e).lower()
-            # 参数降级阶梯：provider 不支持的可选参数 → 去掉立刻重试（不占瞬时错误重试额度）。
-            # 老版 vLLM / Ollama 兼容层 / 部分中转不认 response_format，不降级会整站不可用。
-            if "response_format" in kw and ("response_format" in low or "json_object" in low):
-                kw.pop("response_format")
-                _mark_unsupported(cfg, "response_format")
-                continue
-            if "reasoning_effort" in kw and "reasoning_effort" in low:
-                kw.pop("reasoning_effort")
-                _mark_unsupported(cfg, "reasoning_effort")
-                continue
-            if "extra_body" in kw and ("enable_thinking" in low or "thinking_budget" in low):
-                kw.pop("extra_body")
-                _mark_unsupported(cfg, "extra_body")
-                continue
-            # OpenAI 推理模型要求 max_completion_tokens，旧参数会直接 400
-            if "max_tokens" in kw and "max_completion_tokens" in low:
-                kw["max_completion_tokens"] = kw.pop("max_tokens")
+            if _degrade_params(e, kw, cfg):
                 continue
             # 限流/5xx/网络抖动：退避后重试一次
+            if not retried_transient and _is_transient(e):
+                retried_transient = True
+                time.sleep(1.5)
+                continue
+            raise
+
+
+def chat_stream(messages: list[dict], *, purpose: str = "default", json_mode=False,
+                max_tokens=4096) -> Iterator[str]:
+    """chat() 的流式版：逐段 yield content 增量。
+
+    参数降级阶梯 / 瞬时错误重试与 chat() 一致，但只允许发生在尚未 yield 任何内容之前——
+    已经开始输出后再重试会把两份回答拼在一起，只能直接抛给上层走 error 事件。
+    服务商不支持 stream 时记住并降级为非流式 chat()，全文一次性 yield。
+    """
+    cfg = get_route(purpose)
+    unsupported = _unsupported(cfg)
+    if "stream" in unsupported:
+        # 这家 provider + model 明确拒绝过 stream：别再白撞一趟，直接非流式
+        yield chat(messages, purpose=purpose, json_mode=json_mode, max_tokens=max_tokens)
+        return
+    client = _client(cfg)
+    kw = dict(model=cfg["model"], messages=messages, max_tokens=max_tokens, stream=True)
+    if json_mode and "response_format" not in unsupported:
+        kw["response_format"] = {"type": "json_object"}
+    if "reasoning_effort" not in unsupported and "extra_body" not in unsupported:
+        kw.update(reasoning_kwargs(cfg))
+    retried_transient = False
+    started = False
+    while True:
+        try:
+            stream = client.chat.completions.create(**kw)
+            saw_choices = False
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue    # 部分服务商末尾附带 usage-only 的空 choices chunk，跳过
+                saw_choices = True
+                piece = getattr(choices[0].delta, "content", None) or ""
+                if piece:
+                    started = True
+                    yield piece
+            if not saw_choices:
+                # 整个流都没有 choices：与 chat() 的空 choices 处理一致
+                raise RuntimeError("服务商返回了空 choices（可能触发了内容过滤或额度限制）")
+            return
+        except Exception as e:
+            if started:
+                raise   # 已输出部分内容：降级/重试都会污染回答，直接抛
+            if _degrade_params(e, kw, cfg):
+                continue
+            low = str(e).lower()
+            # 服务商不认 stream 参数：记住并降级非流式。瞬时错误里也可能带 stream 字样
+            # （如 "upstream stream error"），那种不该永久禁用流式，先排除。
+            if kw.get("stream") and "stream" in low and not _is_transient(e):
+                _mark_unsupported(cfg, "stream")
+                yield chat(messages, purpose=purpose, json_mode=json_mode, max_tokens=max_tokens)
+                return
+            # 限流/5xx/网络抖动：退避后重试一次（仅首个增量前）
             if not retried_transient and _is_transient(e):
                 retried_transient = True
                 time.sleep(1.5)
@@ -428,15 +497,23 @@ def tone_hint(familiarity: str | None) -> str:
     return "读者是**进阶**：语言适中，专业术语可直接使用，个别难点稍作说明。"
 
 
-def chat_json(prompt: str, system: str, *, purpose: str = "default",
-              fallback_key: str = "result", max_tokens: int = 4096) -> dict:
-    """要求模型输出 JSON；解析失败时降级为 {fallback_key: 原文}。"""
-    raw = chat([{"role": "system", "content": system + "\n只输出合法 JSON，不要输出任何其他内容。"},
-                {"role": "user", "content": prompt}],
-               purpose=purpose, json_mode=True, max_tokens=max_tokens)
+def parse_json_reply(raw: str, fallback_key: str = "result") -> dict:
+    """解析模型回复里的 JSON；失败时降级为 {fallback_key: 原文}。
+
+    chat_json 与流式对话共用：保证流式完整输出的解析/降级语义与非流式完全一致。
+    """
     try:
         start = raw.find("{")
         end = raw.rfind("}")
         return json.loads(raw[start:end + 1]) if start >= 0 and end > start else {fallback_key: raw}
     except json.JSONDecodeError:
         return {fallback_key: raw}
+
+
+def chat_json(prompt: str, system: str, *, purpose: str = "default",
+              fallback_key: str = "result", max_tokens: int = 4096) -> dict:
+    """要求模型输出 JSON；解析失败时降级为 {fallback_key: 原文}。"""
+    raw = chat([{"role": "system", "content": system + "\n只输出合法 JSON，不要输出任何其他内容。"},
+                {"role": "user", "content": prompt}],
+               purpose=purpose, json_mode=True, max_tokens=max_tokens)
+    return parse_json_reply(raw, fallback_key)

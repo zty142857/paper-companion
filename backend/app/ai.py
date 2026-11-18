@@ -1,6 +1,7 @@
 """块级 AI 能力：段落翻译、子对话（带出处引用与诚实拒答）。"""
 import json
 import re
+from collections.abc import Iterator
 
 from . import llm, search
 from .textblocks import blocks_for_ids, logical_blocks, page_label, paragraph_index
@@ -454,9 +455,138 @@ def translate_inline(structure: dict, block_id: str) -> dict:
             "block_id": block_id, "page": src["page"], "text": text}
 
 
-def chat(structure: dict, block_ids: list[str], history: list[dict], question: str,
-         allow_search: bool = True, familiarity: str | None = None,
-         analysis: dict | None = None, table_id: str = "") -> dict:
+class _AnswerExtractor:
+    """从模型流式输出的 JSON 里增量提取 "answer" 字符串值。
+
+    模型输出 {"answer": "...", "refs": [...]}。喂入原始 chunk，每次返回 answer 值
+    新增的、已反转义的文本。找到 answer 键之前不输出；字符串闭合后停止。
+    转义序列（\\" \\\\ \\n \\uXXXX 等）可能被 chunk 边界切开，所以用逐字符状态机
+    而不是正则/整体 json.loads——半个转义、半个 \\u 码点都留在状态里等下一个 chunk。
+    """
+
+    _SIMPLE_ESC = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+                   "n": "\n", "r": "\r", "t": "\t"}
+    _HEX = "0123456789abcdefABCDEF"
+
+    def __init__(self):
+        # scan → token → after_token → value_wait → value → done
+        self._state = "scan"
+        self._token: list[str] = []   # 当前字符串 token 的原始内容（用于判断是否为 answer 键）
+        self._token_esc = False       # token 内上一字符是反斜杠（找真正的闭合引号）
+        self._esc = ""                # value 内未完成的转义："\\" 或 "\\u" + 0~4 位 hex
+        self._surrogate = 0           # 已解码的高代理项，等待配对的低代理项
+
+    def feed(self, chunk: str) -> str:
+        out: list[str] = []
+        for c in chunk:
+            s = self._state
+            if s == "done":
+                break
+            if s == "scan":
+                # 只认「字符串 token 后跟冒号」的键位置：值字符串后面是 , 或 ]，
+                # 所以 refs 等数组里即使出现 "answer" 字样也不会误认。
+                if c == '"':
+                    self._token = []
+                    self._token_esc = False
+                    self._state = "token"
+            elif s == "token":
+                if self._token_esc:
+                    self._token.append(c)
+                    self._token_esc = False
+                elif c == "\\":
+                    self._token.append(c)
+                    self._token_esc = True
+                elif c == '"':
+                    self._state = "after_token"
+                else:
+                    self._token.append(c)
+            elif s == "after_token":
+                if c.isspace():
+                    continue
+                if c == ":" and "".join(self._token) == "answer":
+                    self._state = "value_wait"
+                elif c == '"':
+                    # 不是 answer 键，但这个引号是下一个 token 的开始，别丢掉
+                    self._token = []
+                    self._token_esc = False
+                    self._state = "token"
+                else:
+                    self._state = "scan"
+            elif s == "value_wait":
+                if c.isspace():
+                    continue
+                if c == '"':
+                    self._state = "value"
+                else:
+                    self._state = "done"   # answer 不是字符串（null/数字等）：无正文可流
+            elif s == "value":
+                self._value_char(c, out)
+        return "".join(out)
+
+    def _flush_surrogate(self, out: list[str]) -> None:
+        # 高代理项没等来低代理项：按 Unicode 惯例输出替换符，不中断流
+        if self._surrogate:
+            out.append("\ufffd")
+            self._surrogate = 0
+
+    def _value_char(self, c: str, out: list[str]) -> None:
+        if self._esc:
+            if self._esc == "\\":
+                if c in self._SIMPLE_ESC:
+                    self._flush_surrogate(out)
+                    out.append(self._SIMPLE_ESC[c])
+                    self._esc = ""
+                elif c == "u":
+                    self._esc = "\\u"
+                else:
+                    # 非法转义：原样输出，宽容处理而不是中断流
+                    self._flush_surrogate(out)
+                    out.append("\\" + c)
+                    self._esc = ""
+            else:
+                # 正在收集 \uXXXX 的 hex 位（可能跨多个 chunk）
+                if c in self._HEX and len(self._esc) < 6:
+                    self._esc += c
+                    if len(self._esc) == 6:
+                        cp = int(self._esc[2:], 16)
+                        self._esc = ""
+                        if 0xD800 <= cp <= 0xDBFF:
+                            self._flush_surrogate(out)
+                            self._surrogate = cp
+                        elif 0xDC00 <= cp <= 0xDFFF and self._surrogate:
+                            out.append(chr(0x10000 + ((self._surrogate - 0xD800) << 10)
+                                           + (cp - 0xDC00)))
+                            self._surrogate = 0
+                        else:
+                            self._flush_surrogate(out)
+                            out.append(chr(cp))
+                else:
+                    # \u 后跟了非 hex：非法转义，原样吐出已收集部分，当前字符重新处理
+                    pending = self._esc
+                    self._esc = ""
+                    self._flush_surrogate(out)
+                    out.append(pending)
+                    self._value_char(c, out)
+            return
+        if c == "\\":
+            self._esc = "\\"
+            return
+        if c == '"':
+            self._flush_surrogate(out)
+            self._state = "done"   # answer 字符串闭合：后面的 refs 等不再输出
+            return
+        self._flush_surrogate(out)
+        out.append(c)
+
+
+def chat_stream(structure: dict, block_ids: list[str], history: list[dict], question: str,
+                allow_search: bool = True, familiarity: str | None = None,
+                analysis: dict | None = None, table_id: str = "") -> Iterator[dict]:
+    """流式对话：yield {"event": "step"|"delta"|"done", "data": {...}}。
+
+    step 在检索进展产生时立刻推送；delta 是后处理前的原始 answer 增量文本；
+    done 与旧 chat() 返回值完全同构（前端用 done 整体替换 delta 累积的文本）。
+    """
     table = next((t for t in (structure.get("tables") or [])
                   if t.get("id") == table_id), None) if table_id else None
     if table:
@@ -486,18 +616,22 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
             "你是检索决策助手，只在上下文确实缺少答案时才建议检索。")
         if not judge.get("enough", True) and judge.get("query"):
             q = judge["query"]
-            steps.append({"step": "search", "text": f"论文中未找到，正在检索 arXiv：{q}"})
+            step = {"step": "search", "text": f"论文中未找到，正在检索 arXiv：{q}"}
+            steps.append(step)
+            yield {"event": "step", "data": step}   # 检索进展实时推送，不等回答生成
             try:
                 hits = search.arxiv(q, limit=3)
                 if hits:
-                    steps.append({"step": "found", "text": f"找到 {len(hits)} 篇相关文献"})
+                    step = {"step": "found", "text": f"找到 {len(hits)} 篇相关文献"}
                     search_ctx = "\n".join(
                         f"- {h['title']}（{h.get('year', '')}，{h.get('url', '')}）：{h.get('abstract', '')[:300]}"
                         for h in hits)
                 else:
-                    steps.append({"step": "found", "text": "未检索到相关文献"})
+                    step = {"step": "found", "text": "未检索到相关文献"}
             except Exception as e:
-                steps.append({"step": "found", "text": f"检索失败：{e}"})
+                step = {"step": "found", "text": f"检索失败：{e}"}
+            steps.append(step)
+            yield {"event": "step", "data": step}
 
     sys = """你是论文阅读学伴，帮助学生精读学术论文。回答规则：
 1. 优先依据「论文上下文」回答，并在相关句子后用 [块ID] 标注出处（如 [b12]）。
@@ -520,7 +654,18 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
 用户问题：{question}
 
 输出 JSON：{{"answer": "回答正文，含 [块ID] 引用", "refs": ["用到的块ID"]}}"""
-    data = llm.chat_json(prompt, sys)
+    # 流式调用：消息与 chat_json 完全一致（含系统提示后缀），保证模型行为不变
+    extractor = _AnswerExtractor()
+    parts: list[str] = []
+    for piece in llm.chat_stream(
+            [{"role": "system", "content": sys + "\n只输出合法 JSON，不要输出任何其他内容。"},
+             {"role": "user", "content": prompt}], json_mode=True):
+        parts.append(piece)
+        inc = extractor.feed(piece)
+        if inc:
+            yield {"event": "delta", "data": {"text": inc}}
+    # 完整输出的解析/降级沿用 chat_json 语义（非 JSON → {result: 原文} → answer 缺失 → 失败文案）
+    data = llm.parse_json_reply("".join(parts))
     valid = {b["id"] for b in structure["blocks"]}
     refs = [r for r in (data.get("refs") or []) if isinstance(r, str) and r in valid]
     answer = _text(data.get("answer")) or "（生成失败，请重试）"
@@ -549,4 +694,20 @@ def chat(structure: dict, block_ids: list[str], history: list[dict], question: s
     if table:
         extra_pages.add(table["page"])
     pages = sorted({b["page"] for b in structure["blocks"] if b["id"] in refs} | extra_pages)[:4]
-    return {"answer": answer, "refs": refs, "pages": pages, "steps": steps}
+    yield {"event": "done", "data": {"answer": answer, "refs": refs, "pages": pages, "steps": steps}}
+
+
+def chat(structure: dict, block_ids: list[str], history: list[dict], question: str,
+         allow_search: bool = True, familiarity: str | None = None,
+         analysis: dict | None = None, table_id: str = "") -> dict:
+    """非流式入口：消费 chat_stream 取 done。签名与返回值和重构前完全一致，旧路由零变化。"""
+    result = None
+    for ev in chat_stream(structure, block_ids, history, question,
+                          allow_search=allow_search, familiarity=familiarity,
+                          analysis=analysis, table_id=table_id):
+        if ev["event"] == "done":
+            result = ev["data"]
+    if result is None:
+        # chat_stream 正常结束必产出 done；走到这里说明流被截断却没抛错
+        raise RuntimeError("对话生成失败：未产出结果")
+    return result

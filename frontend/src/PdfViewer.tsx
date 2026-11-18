@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
+import { Minus, Plus, Sigma } from 'lucide-react'
 import * as pdfjs from 'pdfjs-dist'
+import { Spinner } from './components/Loading'
 import workerUrl from './pdf.worker?worker&url'
 import type { Highlight, TableBox } from './api'
 import InlineTranslation, { MIN_TRANSLATION_FONT } from './InlineTranslation'
@@ -192,6 +194,10 @@ function spanAtRect(pageEl: HTMLElement, r: DOMRect): DOMRect | null {
   }
   return best
 }
+
+// 尊重系统「减少动态效果」偏好：开启时平滑滚动改为瞬时定位，避免诱发眩晕
+const scrollBehavior = (): ScrollBehavior =>
+  matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
 
 const MIN_SCALE = 0.3
 const MAX_SCALE = 4
@@ -806,12 +812,28 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
         div.appendChild(tag)
         wrap.appendChild(div)
         pageEls.current.set(i, { el: div, scale })
+        // 逐页顺序渲染时，尚未轮到的页会白屏较久：先挂一个轻量占位（spinner + 文案），
+        // 渲染结束（无论成败）立即移除。只加视觉提示，不改变渲染顺序与管线。
+        const loading = document.createElement('div')
+        loading.className = 'page-loading'
+        const loadingRoot = createRoot(loading)
+        loadingRoot.render(<><Spinner size={18} /><span>渲染中…</span></>)
+        div.appendChild(loading)
+        let loadingStopped = false
+        const stopLoading = () => {
+          if (loadingStopped) return
+          loadingStopped = true
+          loading.remove()
+          // 与 unmountTranslations 同理：延后卸载，避免在 React 提交阶段同步卸载另一个 root
+          queueMicrotask(() => loadingRoot.unmount())
+        }
         const note = document.createElement('div')
         try {
           await renderPage(page, {
             canvasContext: canvas.getContext('2d')!, viewport: vp,
             transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
           } as any, RENDER_SLOW_MS, () => {
+            stopLoading()   // 慢渲染提示接管占位，避免两条"渲染中"叠在一起
             note.className = 'page-note'
             note.textContent = `第 ${i} 页正在渲染（扫描件首次解码较慢，请稍候）`
             div.appendChild(note)
@@ -822,6 +844,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
           note.textContent = `第 ${i} 页渲染失败：${String((e as Error)?.message || e)}`
           div.appendChild(note)
         }
+        stopLoading()
         note.remove()   // 成功或失败都撤掉"渲染中"提示
         if (dead) return
         try {
@@ -937,7 +960,7 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
       scrollToPage: (n: number) => {
         const pe = pageEls.current.get(n)
         if (!pe) return
-        pe.el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        pe.el.scrollIntoView({ behavior: scrollBehavior(), block: 'start' })
         pe.el.classList.add('flash')
         setTimeout(() => pe.el.classList.remove('flash'), 1400)
       },
@@ -1077,14 +1100,22 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
     if (id) onBlockClick?.(id, e.clientX, e.clientY)
   }
 
+  // 防抖期间滑块已到目标值、画布尚未按新比例重排：百分比如实显示「→ 目标%」，
+  // 避免用户以为当前画面就是该比例
+  const zoomPending = Math.abs(displayScale - scale) > 0.0005
+  const zoomPct = `${Math.round(displayScale * 100)}%`
+
   return (
     <div className={`viewer${formulaMode ? ' formula-mode' : ''}${translationMode ? ' translation-mode' : ''}`}>
       <div className="zoombar">
         <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 8 }}>缩放</span>
-        <button className="btn small" onClick={() => manualSlide(clampScale(displayScale - 0.1))}>−</button>
+        <button className="btn small" aria-label="缩小" title="缩小"
+          onClick={() => manualSlide(clampScale(displayScale - 0.1))}><Minus size={16} /></button>
         <input type="range" className="zoom-slider" min={MIN_SCALE} max={MAX_SCALE} step={0.05}
+          aria-label="缩放比例" aria-valuetext={zoomPct}
           value={displayScale} onChange={(e) => manualSlide(+e.target.value)} />
-        <button className="btn small" onClick={() => manualSlide(clampScale(displayScale + 0.1))}>+</button>
+        <button className="btn small" aria-label="放大" title="放大"
+          onClick={() => manualSlide(clampScale(displayScale + 0.1))}><Plus size={16} /></button>
         <button className="btn small" title="贴合阅读区宽度"
           onClick={() => { const t = fitScale(); if (t != null) { autoFit.current = true; slide(t) } }}>适配</button>
         <button className={formulaMode ? 'btn small primary' : 'btn small'}
@@ -1093,9 +1124,10 @@ export default function PdfViewer({ url, blocks, onReady, onBlockClick, onLayout
             window.getSelection()?.removeAllRanges()
             cancelFormulaDrag()
             setFormulaMode((v) => !v)
-          }}>∑ 框选公式</button>
-        <span style={{ fontSize: 12, color: 'var(--muted)', width: 42, textAlign: 'right' }}>
-          {Math.round(displayScale * 100)}%</span>
+          }}><Sigma size={16} /> 框选公式</button>
+        <span style={{ fontSize: 12, color: 'var(--muted)', width: 56, textAlign: 'right' }}
+          title={zoomPending ? '停止拖动后画布将缩放到该比例' : undefined}>
+          {zoomPending ? `→ ${zoomPct}` : zoomPct}</span>
         <span className="zoombar-hint" style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 'auto', marginRight: 8 }}>
           {formulaMode ? '拖拽框住一个公式，松开自动识别；Esc 取消' : '拖选文字可标亮 / 翻译 · 点击段落可翻译 / 提问'}
         </span>

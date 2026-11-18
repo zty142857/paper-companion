@@ -167,10 +167,10 @@ export const api = {
   list: (): Promise<Paper[]> => fetch('/api/papers').then(j),
   get: (id: string): Promise<Paper> => fetch(`/api/papers/${id}`).then(j),
   deletePaper: (id: string): Promise<any> => fetch(`/api/papers/${id}`, { method: 'DELETE' }).then(j),
-  upload: (file: File, folderId?: string): Promise<{ id: string }> => {
+  upload: (file: File, folderId?: string, signal?: AbortSignal): Promise<{ id: string }> => {
     const fd = new FormData(); fd.append('file', file)
     const q = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ''
-    return fetch(`/api/papers${q}`, { method: 'POST', body: fd }).then(j)
+    return fetch(`/api/papers${q}`, { method: 'POST', body: fd, signal }).then(j)
   },
   retryPaper: (id: string): Promise<{ ok: boolean }> =>
     fetch(`/api/papers/${id}/retry`, { method: 'POST' }).then(j),
@@ -185,8 +185,8 @@ export const api = {
     fetch(`/api/papers/${pid}/move`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ folder_id }) }).then(j),
   copyPaper: (pid: string, folder_id: string | null): Promise<{ id: string }> =>
     fetch(`/api/papers/${pid}/copy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ folder_id }) }).then(j),
-  analyze: (id: string): Promise<Analysis> =>
-    fetch(`/api/papers/${id}/analyze`, { method: 'POST' }).then(j),
+  analyze: (id: string, signal?: AbortSignal): Promise<Analysis> =>
+    fetch(`/api/papers/${id}/analyze`, { method: 'POST', signal }).then(j),
   providers: (): Promise<Provider[]> => fetch('/api/providers').then(j),
   providerPresets: (): Promise<ProviderPreset[]> => fetch('/api/provider-presets').then(j),
   addProvider: (b: { name?: string; base_url?: string; api_key?: string; catalog_id?: string | null }): Promise<Provider> =>
@@ -223,30 +223,80 @@ export const api = {
   delCard: (cid: string): Promise<any> => fetch(`/api/cards/${cid}`, { method: 'DELETE' }).then(j),
   tables: (pid: string): Promise<{ tables: TableBox[]; version: number }> =>
     fetch(`/api/papers/${pid}/tables`).then(j),
-  translate: (pid: string, block_id: string): Promise<{ translation: string; page: number; text?: string }> =>
-    fetch(`/api/papers/${pid}/translate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id }) }).then(j),
+  translate: (pid: string, block_id: string, signal?: AbortSignal): Promise<{ translation: string; page: number; text?: string }> =>
+    fetch(`/api/papers/${pid}/translate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id }), signal }).then(j),
   inlineTranslations: (pid: string): Promise<{ translations: Record<string, string> }> =>
     fetch(`/api/papers/${pid}/translations`).then(j),
   translateInline: (pid: string, block_id: string, force = false, signal?: AbortSignal):
     Promise<{ translation: string; block_id: string; page: number; text: string; cached: boolean }> =>
     fetch(`/api/papers/${pid}/translate-inline`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ block_id, force }), signal }).then(j),
-  translateSelection: (pid: string, body: { text: string; block_id?: string }):
+  translateSelection: (pid: string, body: { text: string; block_id?: string }, signal?: AbortSignal):
     Promise<{ translation: string; block_id: string; page: number }> =>
-    fetch(`/api/papers/${pid}/translate-selection`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
-  explainTerm: (pid: string, body: { term: string; zh?: string; refs?: string[] }):
+    fetch(`/api/papers/${pid}/translate-selection`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal }).then(j),
+  explainTerm: (pid: string, body: { term: string; zh?: string; refs?: string[] }, signal?: AbortSignal):
     Promise<{ term: string; zh: string; expl: string; refs: string[]; pages: number[] }> =>
-    fetch(`/api/papers/${pid}/term`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
-  chat: (pid: string, body: { block_ids: string[]; history: object[]; question: string; table_id?: string }):
+    fetch(`/api/papers/${pid}/term`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal }).then(j),
+  chat: (pid: string, body: { block_ids: string[]; history: object[]; question: string; table_id?: string }, signal?: AbortSignal):
     Promise<{ answer: string; refs: string[]; pages: number[]; steps?: ChatStep[] }> =>
-    fetch(`/api/papers/${pid}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
+    fetch(`/api/papers/${pid}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal }).then(j),
+  /** 流式对话：SSE 事件 step（检索过程）/ delta（回答增量）/ done（最终结果，与 chat 同构）。
+      老后端没有 /chat/stream（404/405）时自动降级为一次性 chat。 */
+  chatStream: async (pid: string, body: { block_ids: string[]; history: object[]; question: string; table_id?: string },
+    cb: { onStep?: (s: ChatStep) => void; onDelta?: (text: string) => void }, signal?: AbortSignal):
+    Promise<{ answer: string; refs: string[]; pages: number[]; steps?: ChatStep[] }> => {
+    const r = await fetch(`/api/papers/${pid}/chat/stream`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal,
+    })
+    if (r.status === 404 || r.status === 405) return api.chat(pid, body, signal)
+    if (!r.ok || !r.body) return j(r)
+    const reader = r.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    let done: { answer: string; refs: string[]; pages: number[]; steps?: ChatStep[] } | null = null
+    // SSE 帧以空行分隔；一帧里可能有 event: 与 data: 两行
+    const handleFrame = (frame: string) => {
+      let ev = 'message'
+      let data = ''
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) ev = line.slice(6).trim()
+        else if (line.startsWith('data:')) data += line.slice(5).trim()
+      }
+      if (!data) return
+      const payload = JSON.parse(data)
+      if (ev === 'step') cb.onStep?.(payload as ChatStep)
+      else if (ev === 'delta') cb.onDelta?.(payload.text ?? '')
+      else if (ev === 'done') done = payload
+      else if (ev === 'error') {
+        const e = new Error(payload.detail || '对话失败') as Error & { code?: string; purpose?: string }
+        e.code = payload.code
+        e.purpose = payload.purpose
+        throw e
+      }
+    }
+    while (true) {
+      const { value, done: eof } = await reader.read()
+      if (eof) break
+      buf += dec.decode(value, { stream: true })
+      let i: number
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, i)
+        buf = buf.slice(i + 2)
+        handleFrame(frame)
+      }
+    }
+    if (buf.trim()) handleFrame(buf)
+    if (!done) throw new Error('回答流中断，请重试')
+    return done
+  },
   profile: (pid: string): Promise<ProfileResponse> => fetch(`/api/papers/${pid}/profile`).then(j),
   survey: (pid: string, body: { domain: string; familiarity: string; known_terms: string[]; reuse?: boolean }): Promise<PaperMeta> =>
     fetch(`/api/papers/${pid}/survey`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
-  makePlan: (pid: string): Promise<ReadingPlan> => fetch(`/api/papers/${pid}/plan`, { method: 'POST' }).then(j),
+  makePlan: (pid: string, signal?: AbortSignal): Promise<ReadingPlan> =>
+    fetch(`/api/papers/${pid}/plan`, { method: 'POST', signal }).then(j),
   savePlan: (pid: string, plan: ReadingPlan): Promise<PaperMeta> =>
     fetch(`/api/papers/${pid}/plan`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ plan }) }).then(j),
-  search: (body: { q?: string; source?: string; doi?: string }): Promise<{ results: SearchResult[] }> =>
-    fetch('/api/search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(j),
+  search: (body: { q?: string; source?: string; doi?: string }, signal?: AbortSignal): Promise<{ results: SearchResult[] }> =>
+    fetch('/api/search', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal }).then(j),
   refs: (pid: string): Promise<{ dois: string[] }> => fetch(`/api/papers/${pid}/refs`).then(j),
   dismissTerm: (pid: string, term: string): Promise<{ dismissed_terms: string[] }> =>
     fetch(`/api/papers/${pid}/dismiss_term`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ term }) }).then(j),
@@ -254,17 +304,18 @@ export const api = {
     fetch(`/api/papers/${pid}/collect`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ collected }) }).then(j),
   setNote: (pid: string, note: string): Promise<{ note: string }> =>
     fetch(`/api/papers/${pid}/note`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ note }) }).then(j),
-  recommend: (pid: string): Promise<RecommendResponse> => fetch(`/api/papers/${pid}/recommend`).then(j),
-  review: (paper_ids: string[] = []): Promise<{ review: string; count: number }> =>
-    fetch('/api/review', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paper_ids }) }).then(j),
-  makeQuiz: (pid: string): Promise<{ questions: QuizQuestion[]; error?: string }> =>
-    fetch(`/api/papers/${pid}/quiz`, { method: 'POST' }).then(j),
+  recommend: (pid: string, signal?: AbortSignal): Promise<RecommendResponse> =>
+    fetch(`/api/papers/${pid}/recommend`, { signal }).then(j),
+  review: (paper_ids: string[] = [], signal?: AbortSignal): Promise<{ review: string; count: number }> =>
+    fetch('/api/review', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paper_ids }), signal }).then(j),
+  makeQuiz: (pid: string, signal?: AbortSignal): Promise<{ questions: QuizQuestion[]; error?: string }> =>
+    fetch(`/api/papers/${pid}/quiz`, { method: 'POST', signal }).then(j),
   getQuiz: (pid: string): Promise<{ quiz?: QuizSaved | null }> =>
     fetch(`/api/papers/${pid}/quiz`).then(j),
   saveQuizAnswers: (pid: string, answers: string[]): Promise<{ ok: boolean }> =>
     fetch(`/api/papers/${pid}/quiz/answers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ answers }) }).then(j),
-  gradeQuiz: (pid: string, questions: QuizQuestion[], answers: string[]): Promise<QuizGrade> =>
-    fetch(`/api/papers/${pid}/quiz/grade`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ questions, answers }) }).then(j),
+  gradeQuiz: (pid: string, questions: QuizQuestion[], answers: string[], signal?: AbortSignal): Promise<QuizGrade> =>
+    fetch(`/api/papers/${pid}/quiz/grade`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ questions, answers }), signal }).then(j),
   highlights: (pid: string): Promise<Highlight[]> => fetch(`/api/papers/${pid}/highlights`).then(j),
   addHighlight: (pid: string, h: NewHighlight): Promise<Highlight> =>
     fetch(`/api/papers/${pid}/highlights`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(h) }).then(j),

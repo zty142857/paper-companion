@@ -1,0 +1,84 @@
+/* ============================================================
+   设计 token：全站唯一的颜色 / 字号 / 间距 / 圆角 / 阴影 / 层级来源。
+   仅亮色主题。新代码一律用变量，禁止再写裸 hex。
+   旧变量名（--bg/--panel/--ink/--muted/--accent/...）保持兼容。
+   ============================================================ */
+:root {
+  /* 基础色 */
+  --bg: #f6f5f1;
+  --panel: #ffffff;
+  --ink: #26282e;
+  --ink-soft: #40444d;          /* 次级正文（原裸值 #40444d） */
+  --muted: #5f6470;             /* 弱化文字：加深后在 --bg/--panel 上均达 WCAG AA */
+
+  /* 强调色（蓝） */
+  --accent: #3b6ef5;            /* 填充/边框/白字按钮底色 */
+  --accent-ink: #2b52c4;        /* 浅底上的蓝字（badge/激活项），达 AA */
+  --accent-soft: #e8eeff;
+  --accent-line: #c7d5ff;
+  --hover: #f2f4fb;
+  --line: #e4e2dc;
+
+  /* 语义色：对话/成功=绿，术语/警告=琥珀，危险=砖红，笔记=棕 */
+  --success: #1f7a45;
+  --success-soft: #e7f6ec;
+  --success-line: #b9e3c8;
+  --chat: #2e9e5b;              /* 卡片色条专用绿（装饰，不做小字） */
+  --chat-soft: #eaf7f0;
+  --warning: #9a5b06;           /* 琥珀深字，浅底上达 AA */
+  --warning-soft: #fdf4e3;
+  --warning-line: #f0cf8f;
+  --warning-hover: #fbe9c6;
+  --danger: #c23d3d;
+  --danger-ink: #a52b2b;
+  --danger-soft: #fef3f2;
+  --danger-line: #fecdca;
+  --note: #8a6d3b;
+  --note-soft: #f6f1e7;
+  --note-paper: #fffdf8;
+
+  /* 字号标尺：最小 12px，淘汰 11px 及以下小字 */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 22px;
+
+  /* 间距标尺 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+
+  /* 圆角 */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 14px;
+  --r-full: 999px;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 4px rgba(0, 0, 0, .06);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, .12);
+  --shadow-lg: 0 10px 32px rgba(0, 0, 0, .18);
+
+  /* 层叠层级：全站统一，禁止随手写数字 */
+  --z-topbar: 30;       /* 顶栏 / 章节侧栏 */
+  --z-modal: 50;        /* 模态遮罩 */
+  --z-pop: 60;          /* 划词调色板 / 段落工具条 */
+  --z-menu: 72;         /* 右键菜单 */
+  --z-float: 80;        /* 译文/公式/表格浮层、底部悬浮提示 */
+  --z-ilpop: 85;        /* 完整译文浮层（压住其他浮层） */
+  --z-toast: 100;       /* toast / confirm 永远最上 */
+
+  /* 布局 */
+  --topbar-h: 54px;
+  /* 卡片轨宽度：1600 以上固定 320；1400–1600 之间随窗口线性压到 260；
+     低于 1400 砍掉左轨，把空间让给论文 */
+  --rail-w: clamp(260px, calc((100% - 1600px) * 0.3 + 320px), 320px);
+  --rail-left: var(--rail-w);
+  --rail-right: var(--rail-w);
+
+  font-family: "Source Han Sans SC", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+}

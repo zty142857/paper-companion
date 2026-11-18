@@ -1,6 +1,8 @@
 import { useRef, useState } from 'react'
+import { BookOpen, Check, ChevronDown, ChevronRight, FileText, X } from 'lucide-react'
 import type { Card } from './api'
 import Markdown from './Markdown'
+import { Spinner } from './components/Loading'
 
 interface Props {
   term: string
@@ -10,6 +12,7 @@ interface Props {
   onExpand: () => void              // 展开（首次展开时按需生成解释）
   onCollapse: () => void
   onDelete: () => void              // 删除术语卡片（隐藏该术语）
+  onCancel?: () => void             // 取消在途的解释生成（长任务可取消）
   onTop: (t: number) => void        // 拖拽中/结束的位置
   onDrop: (t: number) => void       // 松手：重新锚定
   onJump: (page: number) => void
@@ -21,7 +24,7 @@ interface Props {
  * - 点击过（有卡）：与翻译卡同一形态——折叠时只显示卡片头，展开时显示解释正文。
  */
 export default function TermItem({
-  term, zh, top, card, onExpand, onCollapse, onDelete, onTop, onDrop, onJump,
+  term, zh, top, card, onExpand, onCollapse, onDelete, onCancel, onTop, onDrop, onJump,
 }: Props) {
   const [confirmDel, setConfirmDel] = useState(false)
   const drag = useRef<{ startY: number; startTop: number; currentTop: number; moved: boolean } | null>(null)
@@ -71,11 +74,17 @@ export default function TermItem({
         {confirmDel ? (
           <span className="del-confirm">
             <span className="del-ask">删除？</span>
-            <button className="x del-yes" title="确认删除" onClick={(e) => { e.stopPropagation(); setConfirmDel(false); onDelete() }}>✓</button>
-            <button className="x" title="取消" onClick={(e) => { e.stopPropagation(); setConfirmDel(false) }}>✕</button>
+            <button className="x del-yes" title="确认删除" onClick={(e) => { e.stopPropagation(); setConfirmDel(false); onDelete() }}>
+              <span className="ico"><Check size={14} strokeWidth={2} /></span>
+            </button>
+            <button className="x" title="取消" onClick={(e) => { e.stopPropagation(); setConfirmDel(false) }}>
+              <span className="ico"><X size={14} strokeWidth={2} /></span>
+            </button>
           </span>
         ) : (
-          <button className="x" title="删除术语小卡" onClick={(e) => { e.stopPropagation(); setConfirmDel(true) }}>✕</button>
+          <button className="x" title="删除术语小卡" onClick={(e) => { e.stopPropagation(); setConfirmDel(true) }}>
+            <span className="ico"><X size={14} strokeWidth={2} /></span>
+          </button>
         )}
       </div>
     )
@@ -85,26 +94,43 @@ export default function TermItem({
     <div className={`card term${expanded ? ' active' : ''}`} data-id={card?.id || `term:${term}`} data-term={term}
       style={{ top }}>
       <div className="ch" onPointerDown={down} onPointerMove={move} onPointerUp={up} onClick={clickHead}>
-        <span className="ico">📚</span>
+        <span className="ico"><BookOpen size={16} strokeWidth={2} /></span>
         <span className="ct">{term}{zh ? <span className="ct-zh">{zh}</span> : null}</span>
-        <button className="x toggle" title={expanded ? '收起' : '展开并生成解释'} onClick={toggle}>{expanded ? '▾' : '▸'}</button>
+        <button className="x toggle" title={expanded ? '收起' : '展开并生成解释'} onClick={toggle}>
+          <span className="ico">{expanded ? <ChevronDown size={14} strokeWidth={2} /> : <ChevronRight size={14} strokeWidth={2} />}</span>
+        </button>
         {confirmDel ? (
           <span className="del-confirm">
             <span className="del-ask">删除？</span>
-            <button className="x del-yes" title="确认删除" onClick={() => { setConfirmDel(false); onDelete() }}>✓</button>
-            <button className="x" title="取消" onClick={() => setConfirmDel(false)}>✕</button>
+            <button className="x del-yes" title="确认删除" onClick={() => { setConfirmDel(false); onDelete() }}>
+              <span className="ico"><Check size={14} strokeWidth={2} /></span>
+            </button>
+            <button className="x" title="取消" onClick={() => setConfirmDel(false)}>
+              <span className="ico"><X size={14} strokeWidth={2} /></span>
+            </button>
           </span>
         ) : (
-          <button className="x" title="删除术语卡" onClick={() => setConfirmDel(true)}>✕</button>
+          <button className="x" title="删除术语卡" onClick={() => setConfirmDel(true)}>
+            <span className="ico"><X size={14} strokeWidth={2} /></span>
+          </button>
         )}
       </div>
       {expanded && <div className="cb">
         {typeof d.zh === 'string' && d.zh && <div className="term-zh">{d.zh}</div>}
         {error ? <div className="err">解释生成失败：{d.error}</div>
-          : loading ? <div className="loading">正在生成解释…</div>
+          : loading ? (
+            <div className="term-loading">
+              <Spinner size={14} /><span>正在生成解释…</span>
+              {onCancel && <button className="btn small" onClick={onCancel}>取消</button>}
+            </div>
+          )
           : <Markdown className="tr" text={d.expl || ''} />}
         {!!d.pages?.length && <div className="src">
-          {d.pages.map((p: number) => <button key={p} onClick={() => onJump(p)}>📄 第{p}页</button>)}
+          {d.pages.map((p: number) => (
+            <button key={p} onClick={() => onJump(p)}>
+              <span className="ico"><FileText size={12} strokeWidth={2} /></span>第{p}页
+            </button>
+          ))}
         </div>}
       </div>}
     </div>

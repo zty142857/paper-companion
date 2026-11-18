@@ -1,0 +1,148 @@
+/* 模态领域样式：模型设置 / 全篇自测。
+   模态基座（.modal-bg/.modal/.modal h2/label/input/.row/.err）在 components.css，
+   这里只放领域覆盖；颜色/圆角/阴影/字号一律走 tokens.css 变量。 */
+
+/* 行内字段错误：挂在对应输入框下方，比全局 err 更精确 */
+.field-err { font-size: var(--fs-xs); color: var(--danger); line-height: 1.5; margin-top: var(--sp-1); }
+
+/* 测试/目录更新结果：图标 + 文字，成败用语义色 */
+.test-res { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); margin-top: var(--sp-2); line-height: 1.5; }
+.test-res svg { flex: none; }
+.test-res.ok { color: var(--success); }
+.test-res.fail { color: var(--danger); }
+
+/* ---------- 模型设置：提供商 + 两用途路由 ---------- */
+.modal.settings-modal {
+  width: min(920px, 94vw); max-height: 88vh; display: flex; flex-direction: column;
+  padding: 20px var(--sp-5);
+}
+.settings-head { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-3); }
+/* h2 占左，tabs 与关闭 X 靠右；自绘头部也要给标准 X 留位置 */
+.settings-head h2 { margin: 0 auto 0 0; font-size: var(--fs-lg); }
+.settings-tabs { display: flex; gap: var(--sp-1); background: var(--hover); padding: 3px; border-radius: var(--r-md); }
+.settings-tabs button {
+  border: 0; background: transparent; padding: 5px 12px; border-radius: var(--r-sm);
+  font-size: var(--fs-sm); color: var(--muted); cursor: pointer;
+}
+.settings-tabs button:hover { color: var(--ink); }
+.settings-tabs button.active { background: var(--panel); color: var(--ink); font-weight: 500; box-shadow: var(--shadow-sm); }
+.modal.settings-modal textarea {
+  width: 100%; border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-2) 10px;
+  font-size: var(--fs-xs); font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  line-height: 1.5; resize: vertical; color: var(--ink); background: var(--panel);
+}
+.settings-modal .loading { display: flex; align-items: center; gap: var(--sp-2); }
+/* 两个面板常驻挂载（保住未保存表单），hidden 切换时要显式压过 display:grid */
+.route-panel[hidden], .provider-panel[hidden] { display: none; }
+.route-panel { overflow-y: auto; min-height: 0; }
+.route-row { border: 1px solid var(--line); border-radius: var(--r-lg); padding: var(--sp-3) var(--sp-4); margin-top: var(--sp-3); }
+.route-head { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: var(--sp-2); flex-wrap: wrap; }
+.route-grid { display: grid; grid-template-columns: 1.1fr 1.4fr 1fr auto; gap: var(--sp-2); align-items: start; }
+.route-grid select { width: 100%; }
+.effort-cell, .model-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.link-btn {
+  align-self: flex-start; border: 0; background: transparent; color: var(--accent-ink);
+  font-size: var(--fs-xs); cursor: pointer; padding: 0;
+}
+.link-btn:hover { text-decoration: underline; }
+.hint-tiny { font-size: var(--fs-xs); color: var(--muted); }
+.hint { font-size: var(--fs-xs); color: var(--muted); line-height: 1.7; margin-top: var(--sp-3); }
+.hint-warn {
+  font-size: var(--fs-xs); color: var(--warning); background: var(--warning-soft);
+  border: 1px solid var(--warning-line); border-radius: var(--r-md);
+  padding: 6px 9px; margin: var(--sp-2) 0; line-height: 1.6;
+}
+/* 保存按钮旁的脏状态提示：margin-right:auto 把它推到行首 */
+.dirty-hint { margin-right: auto; align-self: center; font-size: var(--fs-xs); color: var(--warning); }
+.row-inline { display: flex; gap: var(--sp-2); align-items: center; }
+.row-inline input { flex: 1; }
+.provider-panel { display: grid; grid-template-columns: 210px 1fr; gap: var(--sp-4); min-height: 0; flex: 1; overflow: hidden; margin-top: var(--sp-1); }
+.provider-side {
+  display: flex; flex-direction: column; gap: 6px; border-right: 1px solid var(--line);
+  padding-right: var(--sp-3); overflow-y: auto;
+}
+.provider-item {
+  text-align: left; border: 1px solid transparent; background: transparent; border-radius: var(--r-md);
+  padding: 7px 9px; cursor: pointer; display: flex; flex-direction: column; gap: 2px;
+  font: inherit; color: inherit;
+}
+.provider-item:hover { background: var(--hover); }
+/* 激活项用强调浅底，与 hover 灰底拉开层级 */
+.provider-item.active { background: var(--accent-soft); border-color: var(--accent-line); }
+.provider-item.active .pi-name { color: var(--accent-ink); font-weight: 500; }
+.pi-name { font-size: var(--fs-sm); }
+.pi-meta { font-size: var(--fs-xs); color: var(--muted); }
+.provider-detail { overflow-y: auto; padding-right: var(--sp-1); min-width: 0; }
+.detail-head { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: 2px; }
+.model-block { margin-top: var(--sp-4); border-top: 1px solid var(--line); padding-top: var(--sp-3); }
+.model-toolbar { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); margin-bottom: 6px; }
+.model-list { max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-md); margin-top: var(--sp-2); }
+label.model-row {
+  display: flex; align-items: center; gap: var(--sp-2); padding: 5px 9px; margin: 0;
+  font-size: var(--fs-xs); color: inherit; border-bottom: 1px solid var(--line); cursor: pointer;
+}
+label.model-row:last-child { border-bottom: 0; }
+/* 键盘勾选时整行也要有可见反馈，不只靠 hover */
+label.model-row:hover, label.model-row:focus-within { background: var(--hover); }
+.modal .model-row input[type="checkbox"] { width: auto; margin: 0; flex: none; accent-color: var(--accent); }
+.model-row .mid { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.model-row .mmeta { color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; }
+.modal .route-grid input, .modal .route-grid select { padding: 7px 9px; font-size: var(--fs-xs); }
+/* emoji 换 lucide 后，按钮内图标与文字垂直对齐 */
+.settings-modal .btn, .modal.quiz .btn { display: inline-flex; align-items: center; gap: 6px; }
+@media (max-width: 720px) {
+  .route-grid { grid-template-columns: 1fr 1fr; }
+  .provider-panel { grid-template-columns: 1fr; }
+  .provider-side { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 var(--sp-2); max-height: 150px; }
+}
+
+/* ---------- 全篇自测 ---------- */
+/* 底部操作区固定：题卡列表独立滚动，提交/关闭永远够得着 */
+.modal.quiz { width: 640px; max-height: 86vh; display: flex; flex-direction: column; overflow: hidden; }
+.modal.quiz .modal-foot { flex: none; }
+.quiz-score { color: var(--success); font-size: var(--fs-sm); font-weight: 500; margin-left: var(--sp-2); }
+.quiz-status { display: flex; align-items: center; gap: var(--sp-2); color: var(--muted); font-size: var(--fs-sm); margin: var(--sp-2) 0; }
+.quiz-making { display: flex; flex-direction: column; gap: var(--sp-4); margin: var(--sp-3) 0; }
+.quiz-idle {
+  display: flex; flex-direction: column; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-5) 0; color: var(--muted); font-size: var(--fs-sm);
+}
+.quiz-body {
+  display: flex; flex-direction: column; gap: var(--sp-4); margin: var(--sp-2) 0;
+  overflow-y: auto; min-height: 0; padding-right: var(--sp-1);
+}
+.q { border: 1px solid var(--line); border-radius: var(--r-lg); padding: var(--sp-3) var(--sp-4); }
+.q.right { border-color: var(--success-line); background: var(--success-soft); }
+.q.wrong { border-color: var(--danger-line); background: var(--danger-soft); }
+.q .qt { font-size: var(--fs-md); font-weight: 600; line-height: 1.6; margin-bottom: var(--sp-2); }
+.mark { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-xs); font-weight: 400; margin-left: var(--sp-2); vertical-align: middle; }
+.mark.ok { color: var(--success); }
+.mark.no { color: var(--danger); }
+.opts { display: flex; flex-direction: column; gap: var(--sp-2); }
+/* 用 .opts .opt 提高优先级，压过基座 .modal label 的 block/margin/muted */
+.opts .opt {
+  display: flex; gap: var(--sp-2); align-items: flex-start; margin: 0;
+  font-size: var(--fs-sm); line-height: 1.5; color: var(--ink);
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--r-md);
+  cursor: pointer; background: var(--panel);
+}
+.opts .opt:hover { background: var(--hover); }
+/* 选项是 label 包 radio：键盘焦点落在 radio 上时整行给出焦点环 */
+.opts .opt:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.opts .opt.on { border-color: var(--accent); background: var(--accent-soft); }
+.opts .opt.ans { border-color: var(--success-line); background: var(--success-soft); }
+.opts .opt input[type="radio"] { accent-color: var(--accent); margin-top: 3px; flex: none; }
+.qa {
+  width: 100%; border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-2) 10px;
+  font-size: var(--fs-sm); font-family: inherit; line-height: 1.5; resize: vertical;
+  color: var(--ink); background: var(--panel);
+}
+.qfb { font-size: var(--fs-sm); color: var(--ink-soft); margin-top: var(--sp-2); display: flex; flex-direction: column; gap: var(--sp-1); line-height: 1.6; }
+.qfb .qexp { color: var(--muted); }
+.qfb .src { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.qfb .src button {
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  border: 1px solid var(--line); background: var(--panel); border-radius: var(--r-sm);
+  padding: 3px 8px; font-size: var(--fs-xs); color: var(--accent-ink); cursor: pointer;
+}
+.qfb .src button:hover { background: var(--accent-soft); border-color: var(--accent-line); }

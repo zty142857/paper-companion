@@ -1,0 +1,159 @@
+/* PDF 渲染：页面 / 文本层 / 缩放条 / 标亮 / 原位译文层 */
+.viewer {
+  flex: 1 1 0; width: auto; min-width: 0; max-width: 1060px; padding: 0 9px 40px;
+  border-left: 2px solid var(--accent); border-right: 2px solid var(--accent);
+  background: var(--panel);
+}
+.viewer > div:last-child { overflow-x: auto; overflow-y: hidden; }
+.page {
+  margin: 16px auto; background: var(--panel); box-shadow: var(--shadow-sm);
+  border: 2px solid transparent; border-radius: 2px; position: relative;
+  /* 把页内覆盖层（标亮/译文/公式框）关进页面自己的层叠上下文，
+     这样译文层的 z-index 能压住字形与标亮，又不会盖到 zoombar 等全局工具上 */
+  isolation: isolate;
+}
+.page.flash { border-color: var(--accent); }
+.page canvas { display: block; }
+/* 与 pdf.js 6 官方 textLayer 规则对齐：span 的字号必须由 --font-height
+   乘缩放因子得到，否则上下标/公式会被统一渲染成 16px，选中框互相重叠。 */
+.textLayer {
+  position: absolute; inset: 0; overflow: clip; text-align: initial;
+  line-height: 1; letter-spacing: normal; word-spacing: normal;
+  -webkit-text-size-adjust: none; text-size-adjust: none;
+  forced-color-adjust: none; transform-origin: 0 0;
+  caret-color: CanvasText; z-index: 0;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor, 1) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+.textLayer span, .textLayer br {
+  color: transparent; position: absolute; white-space: pre; cursor: text;
+  transform-origin: 0% 0%; user-select: text;
+}
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1; --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1; --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.textLayer span[role="img"] { user-select: none; cursor: default; }
+.textLayer ::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.textLayer br::selection { background: transparent; }
+.textLayer .endOfContent { display: block; position: absolute; inset: 100% 0 0; z-index: -1; cursor: default; user-select: none; }
+.viewer.formula-mode .textLayer, .viewer.formula-mode .textLayer * { user-select: none !important; }
+.viewer.formula-mode .page { cursor: crosshair; }
+.formula-drag {
+  position: absolute; z-index: 7; pointer-events: none;
+  border: 1.5px dashed var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  border-radius: 2px;
+}
+
+.page .pn { position: absolute; right: -2px; bottom: -20px; font-size: var(--fs-xs); color: var(--muted); }
+.page .page-fail {
+  position: absolute; left: 8px; right: 8px; top: 42%; text-align: center; font-size: var(--fs-xs);
+  color: var(--danger-ink); background: color-mix(in srgb, var(--danger-soft) 94%, transparent);
+  border: 1px solid var(--danger-line); border-radius: var(--r-md); padding: 8px 10px;
+}
+.page .page-note {
+  position: absolute; left: 8px; right: 8px; top: 42%; text-align: center; font-size: var(--fs-xs);
+  color: var(--accent-ink); background: color-mix(in srgb, var(--accent-soft) 94%, transparent);
+  border: 1px solid var(--accent-line); border-radius: var(--r-md); padding: 8px 10px;
+}
+/* 逐页顺序渲染的占位：页框内居中 spinner + 文案，渲染完成后由 JS 移除。
+   pointer-events 关掉，不挡划词/点击；页内层级沿用 DOM 顺序即可盖住空白画布。 */
+.page .page-loading {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px;
+  color: var(--muted); font-size: var(--fs-xs); pointer-events: none;
+}
+.zoombar {
+  position: sticky; top: 0; z-index: 5; display: flex; gap: 6px; align-items: center;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(4px); padding: 8px 0;
+}
+.zoombar > * { flex: none; }
+/* 缩放 +/- 与「框选公式」换成 lucide 图标后，需要 flex 让图标与文字垂直对齐 */
+.zoombar .btn { white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.zoombar .btn svg { flex: none; }
+.zoombar-hint { white-space: nowrap; }
+.zoom-slider { width: 150px; accent-color: var(--accent); cursor: pointer; }
+@media (max-width: 1120px) { .zoombar-hint { display: none; } }
+@media (max-width: 900px) { .zoom-slider { width: 96px; } }
+
+/* 原文标亮 */
+.hl-layer { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.hl-rect {
+  position: absolute; border-radius: 2px; pointer-events: auto; cursor: pointer;
+  mix-blend-mode: multiply;
+}
+.hl-rect:hover { outline: 1px solid color-mix(in srgb, var(--ink) 28%, transparent); }
+.search-hit {
+  position: absolute; z-index: 4;
+  background: color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: 2px; pointer-events: none;
+}
+
+/* ---------- 原位译文层 ---------- */
+/* 页面坐标系里的覆盖层：盖住原字形（textLayer z0）与标亮（hl z2 / search z4），
+   但低于公式拖拽框（z7）；.page 的 isolation 保证它不会盖到页面外的工具条。 */
+.il-layer { position: absolute; inset: 0; z-index: 6; pointer-events: none; }
+.il-item {
+  position: absolute; box-sizing: border-box; overflow: hidden; text-align: left;
+  background: var(--panel); color: var(--ink); border-radius: 2px; padding: 4px 5px;
+  line-height: 1.38; word-break: break-word; overflow-wrap: anywhere;
+  pointer-events: auto; user-select: text; cursor: text;
+  /* 白色光晕盖掉原字形的抗锯齿边缘，避免灰边露出来（功能性，勿删） */
+  box-shadow: 0 0 0 2px var(--panel);
+}
+.il-item.heading { font-weight: 600; }
+.il-item .il-body { margin: 0; }
+.il-item .il-body .md { line-height: 1.38; }
+.il-item .il-body .md > *:first-child { margin-top: 0; }
+.il-item .il-body .md > *:last-child { margin-bottom: 0; }
+.il-item .il-body .md-p { margin: 2px 0; }
+.il-item .il-body .md-h { margin: 3px 0 2px; font-size: 1em; }
+.il-item .il-body .md-list { margin: 2px 0; padding-left: 16px; }
+.il-item .il-body .math-display { margin: 2px 0; }
+.il-item .il-more {
+  position: absolute; z-index: 1; width: 16px; height: 16px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 3px;
+  background: color-mix(in srgb, var(--panel) 90%, transparent);
+  color: var(--accent); cursor: pointer;
+  /* 同 .il-item 的白光晕：把按钮底下的原字形边缘盖干净（功能性，勿删） */
+  box-shadow: 0 0 3px 2px color-mix(in srgb, var(--panel) 90%, transparent);
+}
+.il-item .il-more:hover { background: var(--accent-soft); }
+.il-item ::selection, .il-pop-b ::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+
+/* 完整译文浮层：fixed 定位 + portal 到 body，不参与页面布局、不改变页面尺寸 */
+.il-pop {
+  position: fixed; z-index: var(--z-ilpop); display: flex; flex-direction: column;
+  max-height: 70vh; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r-lg); box-shadow: var(--shadow-lg); overflow: hidden;
+}
+.il-pop-h {
+  display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+  background: var(--accent-soft); border-bottom: 1px solid var(--line);
+  font-size: var(--fs-sm); font-weight: 700;
+}
+.il-pop-h span { flex: 1; }
+.il-pop-h .x {
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: none; padding: 2px; border-radius: var(--r-sm);
+  color: var(--muted); cursor: pointer;
+}
+.il-pop-h .x:hover { color: var(--accent); }
+.il-pop-b { padding: 10px 13px; overflow: auto; font-size: var(--fs-md); line-height: 1.75; }
+.il-pop-b .md { line-height: 1.75; }
+
+/* 全局译文模式：原文标亮让位给译文；原文 textLayer 不再接受划词/标亮交互 */
+.viewer.translation-mode .hl-layer,
+.viewer.translation-mode .search-hit { display: none; }
+.viewer.translation-mode .textLayer,
+.viewer.translation-mode .textLayer * { user-select: none !important; pointer-events: none !important; }
+/* 公式框选优先：译文层不拦截拖拽，松手后仍能框住被译文覆盖的公式 */
+.viewer.formula-mode .il-layer,
+.viewer.formula-mode .il-layer * { pointer-events: none !important; }

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { ChevronDown, X } from 'lucide-react'
 import Markdown from './Markdown'
 
 /** 原位译文层里的一块：坐标/尺寸已经是页面 CSS 像素（已乘当前缩放）。 */
@@ -21,6 +22,8 @@ export interface InlineTranslationBlock {
 // 自动缩字的下限：再小就截断并给「展开全文」，不做无意义的压缩。
 export const MIN_TRANSLATION_FONT = 12
 const PAD_Y = 4
+// 「展开」按钮 16px 见方，定位时距块右/下边缘留 1px，避免被 overflow:hidden 裁掉
+const MORE_EDGE = 15
 
 interface Props {
   items: InlineTranslationBlock[]
@@ -78,7 +81,7 @@ function TranslationItem({ b }: { b: InlineTranslationBlock }) {
       if (avail <= 6) {
         body.style.fontSize = `${MIN_TRANSLATION_FONT}px`
         box.style.height = `${b.height}px`
-        setArrow({ left: Math.max(6, b.width - 13), top: Math.max(0, b.height - 13) })
+        setArrow({ left: Math.max(6, b.width - MORE_EDGE), top: Math.max(0, b.height - MORE_EDGE) })
         return
       }
       fitFont(body, avail, b.fontSize)
@@ -108,7 +111,7 @@ function TranslationItem({ b }: { b: InlineTranslationBlock }) {
       if (!rects.length) {
         body.style.maxHeight = `${Math.max(1, finalH - PAD_Y * 2)}px`
         body.style.overflow = 'hidden'
-        setArrow({ left: Math.max(6, b.width - 13), top: Math.max(0, finalH - 13) })
+        setArrow({ left: Math.max(6, b.width - MORE_EDGE), top: Math.max(0, finalH - MORE_EDGE) })
         return
       }
       const lastBottom = Math.max(...rects.map((r) => r.bottom))
@@ -118,8 +121,8 @@ function TranslationItem({ b }: { b: InlineTranslationBlock }) {
       body.style.maxHeight = `${Math.max(1, lastBottom - bodyRect.top)}px`
       body.style.overflow = 'hidden'
       setArrow({
-        left: Math.max(2, Math.min(b.width - 13, right - boxRect.left + 2)),
-        top: Math.max(0, Math.min(finalH - 13, top - boxRect.top + 1)),
+        left: Math.max(2, Math.min(b.width - MORE_EDGE, right - boxRect.left + 2)),
+        top: Math.max(0, Math.min(finalH - MORE_EDGE, top - boxRect.top + 1)),
       })
     }
     fit()
@@ -168,20 +171,21 @@ function TranslationItem({ b }: { b: InlineTranslationBlock }) {
       style={{ left: b.left, top: b.top, width: b.width, height: b.height }}>
       <div ref={bodyRef} className="il-body"><Markdown text={b.text} /></div>
       {arrow && (
-        <button className="il-more" title="展开完整译文" aria-label="展开完整译文"
+        <button className="il-more" title="查看完整译文" aria-label="查看完整译文"
           style={{ left: arrow.left, top: arrow.top }}
           onPointerDown={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
-          onClick={openFull}>▾</button>
+          onClick={openFull}><ChevronDown size={16} /></button>
       )}
       {open && createPortal(
-        <div ref={popRef} className="il-pop"
+        <div ref={popRef} className="il-pop" role="dialog" aria-label="完整译文"
           style={{ left: pos.left, top: pos.top, width: pos.width }}
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}>
           <div className="il-pop-h">
             <span>译文全文</span>
-            <button className="x" title="关闭" onClick={() => setOpen(false)}>×</button>
+            <button className="x" title="关闭" aria-label="关闭" onClick={() => setOpen(false)}>
+              <X size={16} /></button>
           </div>
           <div className="il-pop-b"><Markdown text={b.text} /></div>
         </div>,

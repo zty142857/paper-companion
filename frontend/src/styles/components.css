@@ -1,0 +1,120 @@
+/* ============================================================
+   交互基座样式：Modal / Toast / Confirm / Loading。
+   由 index.css 在 base 之后、领域文件之前引入，领域文件可覆盖这里。
+   颜色/圆角/阴影/层级一律用 tokens.css 变量（遮罩色为合同指定的唯一例外）。
+   动画全部用标准 animation/transition，服从 base.css 的
+   prefers-reduced-motion 全局降级。
+   ============================================================ */
+
+/* ---------- Modal ---------- */
+.modal-bg {
+  position: fixed; inset: 0; z-index: var(--z-modal);
+  background: rgba(20, 22, 28, .45);
+  display: flex; align-items: center; justify-content: center;
+  animation: modal-bg-in .18s ease-out;
+  /* 基础过渡也声明：守卫拒绝关闭、.closing 被摘掉时能平滑淡回 */
+  transition: opacity .14s ease;
+}
+.modal {
+  background: var(--panel); border-radius: var(--r-xl); box-shadow: var(--shadow-lg);
+  width: 430px; max-width: 92vw; padding: 20px;
+  animation: modal-in .18s ease-out;
+  transition: opacity .14s ease, transform .14s ease;
+}
+/* 容器只是焦点陷阱的兜底落点，不是可交互控件，不画焦点环 */
+.modal:focus { outline: none; }
+
+/* 退场：JS 播完 .closing 过渡后才调 onClose（见 Modal.tsx） */
+.modal-bg.closing { opacity: 0; }
+.modal-bg.closing .modal { opacity: 0; transform: scale(.96); }
+
+@keyframes modal-bg-in { from { opacity: 0; } }
+@keyframes modal-in { from { opacity: 0; transform: scale(.96); } }
+
+/* 标准头部：title 传入时由 Modal 渲染；自绘头部的领域弹窗不受影响 */
+.modal h2 { font-size: 16px; margin-bottom: 14px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.modal-head h2 { margin: 0; }
+.modal-x {
+  border: 0; background: transparent; color: var(--muted);
+  padding: 4px; border-radius: var(--r-sm); display: inline-flex; align-items: center; flex: none;
+}
+.modal-x:hover { background: var(--hover); color: var(--ink); }
+.modal-x:disabled { opacity: .4; cursor: not-allowed; }
+
+/* 表单基础件：与旧版观感一致，圆角/颜色改走 token */
+.modal label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+.modal input, .modal select {
+  width: 100%; border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 8px 10px; font-size: 13px; font-family: inherit;
+  color: var(--ink); background: var(--panel);
+}
+/* 勾选/单选不该被拉成整行宽 */
+.modal input[type="checkbox"], .modal input[type="radio"] { width: auto; }
+
+.modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.err { color: var(--danger); font-size: 12px; margin-top: 8px; }
+
+/* ---------- Confirm ----------
+   confirm 必须盖住普通 modal。className 按合同落在 .modal 上，
+   用 :has 反选它的遮罩，把层级提到 toast 层（全站最高）。 */
+.modal-bg:has(> .confirm-bg) { z-index: var(--z-toast); }
+.confirm-bg { width: 400px; }
+.confirm-msg { font-size: 13px; color: var(--ink-soft); line-height: 1.7; }
+
+/* ---------- Toast ---------- */
+.toast-stack {
+  position: fixed; top: calc(var(--topbar-h) + 12px); right: 16px;
+  z-index: var(--z-toast);
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: min(360px, calc(100vw - 32px));
+  /* 堆叠容器不挡页面点击，只有 toast 本体可交互 */
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: var(--panel); box-shadow: var(--shadow-md);
+  font-size: 13px; line-height: 1.5; color: var(--ink);
+  animation: toast-in .2s ease-out;
+}
+.toast.leaving { opacity: 0; transform: translateX(12px); transition: opacity .18s ease-in, transform .18s ease-in; }
+.toast > svg { flex: none; margin-top: 2px; }
+/* 语义色走 token：浅底 + 同系描边 + 深色图标，小字也达 AA */
+.toast.success { background: var(--success-soft); border-color: var(--success-line); }
+.toast.success > svg { color: var(--success); }
+.toast.error { background: var(--danger-soft); border-color: var(--danger-line); }
+.toast.error > svg { color: var(--danger); }
+.toast.info { background: var(--accent-soft); border-color: var(--accent-line); }
+.toast.info > svg { color: var(--accent-ink); }
+.toast-msg { flex: 1; min-width: 0; word-break: break-word; }
+.toast-x {
+  border: 0; background: transparent; color: var(--muted);
+  padding: 2px; border-radius: var(--r-sm); display: inline-flex; flex: none;
+}
+.toast-x:hover { background: var(--danger-line); color: var(--danger-ink); }
+@keyframes toast-in { from { opacity: 0; transform: translateX(16px); } }
+
+/* ---------- Loading ---------- */
+.spinner {
+  display: inline-block; flex: none; vertical-align: -2px;
+  border: 2px solid currentColor; border-top-color: transparent;
+  border-radius: var(--r-full);
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.skeleton { display: flex; flex-direction: column; gap: 10px; }
+.skeleton-line {
+  height: 12px; border-radius: var(--r-sm);
+  /* 微光扫过：两端同色保证平铺循环无缝 */
+  background: linear-gradient(90deg, var(--hover) 25%, var(--line) 50%, var(--hover) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-sweep 1.4s ease infinite;
+}
+@keyframes skeleton-sweep {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
